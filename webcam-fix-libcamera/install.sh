@@ -39,7 +39,7 @@ echo "=============================================="
 echo ""
 
 # ──────────────────────────────────────────────
-# [1/13] Root check
+# [1/14] Root check
 # ──────────────────────────────────────────────
 if [[ $EUID -eq 0 ]]; then
     echo "ERROR: Don't run this as root. The script will use sudo where needed."
@@ -47,9 +47,9 @@ if [[ $EUID -eq 0 ]]; then
 fi
 
 # ──────────────────────────────────────────────
-# [2/13] Distro detection
+# [2/14] Distro detection
 # ──────────────────────────────────────────────
-echo "[2/13] Detecting distro..."
+echo "[2/14] Detecting distro..."
 if command -v pacman >/dev/null 2>&1; then
     DISTRO="arch"
     DISTRO_LABEL="Arch-based"
@@ -74,10 +74,10 @@ fi
 echo "  ✓ $DISTRO_LABEL detected"
 
 # ──────────────────────────────────────────────
-# [3/13] Verify hardware
+# [3/14] Verify hardware
 # ──────────────────────────────────────────────
 echo ""
-echo "[3/13] Verifying hardware..."
+echo "[3/14] Verifying hardware..."
 
 IPU_GENERATION=""
 if lspci -d 8086:7d19 2>/dev/null | grep -q .; then
@@ -131,10 +131,10 @@ fi
 echo "  ✓ IVSC firmware present"
 
 # ──────────────────────────────────────────────
-# [4/13] Check kernel version
+# [4/14] Check kernel version
 # ──────────────────────────────────────────────
 echo ""
-echo "[4/13] Checking kernel version..."
+echo "[4/14] Checking kernel version..."
 KERNEL_VER=$(uname -r)
 KERNEL_MAJOR=$(echo "$KERNEL_VER" | cut -d. -f1)
 KERNEL_MINOR=$(echo "$KERNEL_VER" | cut -d. -f2)
@@ -159,10 +159,10 @@ fi
 echo "  ✓ Kernel $KERNEL_VER (>= 6.10 required)"
 
 # ──────────────────────────────────────────────
-# [5/13] Check kernel modules
+# [5/14] Check kernel modules
 # ──────────────────────────────────────────────
 echo ""
-echo "[5/13] Checking kernel modules..."
+echo "[5/14] Checking kernel modules..."
 MISSING_MODS=()
 for mod in mei-vsc mei-vsc-hw ivsc-ace ivsc-csi intel-ipu6 intel-ipu6-isys ov02c10; do
     modpath=$(find /lib/modules/$(uname -r) -name "${mod//-/_}.ko*" -o -name "${mod}.ko*" 2>/dev/null | head -1)
@@ -193,10 +193,10 @@ fi
 echo "  ✓ All required kernel modules found"
 
 # ──────────────────────────────────────────────
-# [6/13] Check OV02C10 sensor probe (26 MHz clock fix)
+# [6/14] Check OV02C10 sensor probe (26 MHz clock fix)
 # ──────────────────────────────────────────────
 echo ""
-echo "[6/13] Checking OV02C10 sensor probe status..."
+echo "[6/14] Checking OV02C10 sensor probe status..."
 
 # Some Galaxy Book models (notably Book3/Book4 Ultra with Raptor Lake) have a
 # 26 MHz external clock instead of the expected 19.2 MHz. The upstream ov02c10
@@ -280,10 +280,10 @@ if ! $DKMS_26MHZ_INSTALLED; then
 fi
 
 # ──────────────────────────────────────────────
-# [7/13] Load and persist IVSC modules
+# [7/14] Load and persist IVSC modules
 # ──────────────────────────────────────────────
 echo ""
-echo "[7/13] Loading IVSC kernel modules..."
+echo "[7/14] Loading IVSC kernel modules..."
 for mod in mei-vsc mei-vsc-hw ivsc-ace ivsc-csi; do
     if ! lsmod | grep -q "$(echo $mod | tr '-' '_')"; then
         sudo modprobe "$mod"
@@ -368,10 +368,131 @@ MKINIT_EOF
 esac
 
 # ──────────────────────────────────────────────
-# [8/13] Install/build libcamera
+# [8/14] Samsung camera rotation fix (ipu-bridge DKMS)
 # ──────────────────────────────────────────────
 echo ""
-echo "[8/13] Installing libcamera..."
+echo "[8/14] Checking camera rotation fix..."
+
+# Samsung Galaxy Book3/Book4 models have their OV02C10 sensor mounted
+# upside-down, but Samsung's BIOS reports rotation=0. The kernel's
+# ipu-bridge driver has a DMI quirk table for this, but the Samsung entries
+# aren't upstream yet. Ship a patched ipu-bridge.ko via DKMS until they are.
+
+NEEDS_ROTATION_FIX=false
+DMI_VENDOR=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || true)
+DMI_PRODUCT=$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)
+if [[ "$DMI_VENDOR" == "SAMSUNG ELECTRONICS CO., LTD." ]]; then
+    case "$DMI_PRODUCT" in
+        940XFG|960XFG) NEEDS_ROTATION_FIX=true ;;
+    esac
+fi
+
+IPU_BRIDGE_FIX_VER="1.0"
+IPU_BRIDGE_FIX_SRC="/usr/src/ipu-bridge-fix-${IPU_BRIDGE_FIX_VER}"
+
+if $NEEDS_ROTATION_FIX; then
+    IPU_BRIDGE_DIR="$SCRIPT_DIR/../webcam-fix-book5/ipu-bridge-fix"
+
+    if [[ ! -d "$IPU_BRIDGE_DIR" ]]; then
+        # Try downloading from GitHub if not present locally
+        echo "  ipu-bridge-fix not found locally, downloading..."
+        IPU_BRIDGE_DIR="/tmp/ipu-bridge-fix"
+        rm -rf "$IPU_BRIDGE_DIR"
+        mkdir -p "$IPU_BRIDGE_DIR"
+        GITHUB_RAW="https://raw.githubusercontent.com/Andycodeman/samsung-galaxy-book4-linux-fixes/main/webcam-fix-book5/ipu-bridge-fix"
+        for fname in ipu-bridge.c Makefile dkms.conf; do
+            if ! curl -fsSL "$GITHUB_RAW/$fname" -o "$IPU_BRIDGE_DIR/$fname"; then
+                echo "  ERROR: Failed to download $fname"
+                echo "         Please clone the full repo and try again."
+                rm -rf "$IPU_BRIDGE_DIR"
+                IPU_BRIDGE_DIR=""
+                break
+            fi
+        done
+    fi
+
+    if [[ -n "$IPU_BRIDGE_DIR" ]]; then
+        # Check if already installed and working
+        if dkms status "ipu-bridge-fix/${IPU_BRIDGE_FIX_VER}" 2>/dev/null | grep -q "installed"; then
+            echo "  ✓ ipu-bridge-fix/${IPU_BRIDGE_FIX_VER} already installed via DKMS"
+        else
+            # Check if the native kernel module already has the fix
+            NATIVE_IPU_BRIDGE=$(find "/lib/modules/$(uname -r)/kernel" -name "ipu-bridge*" 2>/dev/null | head -1)
+            UPSTREAM_HAS_FIX=false
+            if [ -n "$NATIVE_IPU_BRIDGE" ]; then
+                case "$NATIVE_IPU_BRIDGE" in
+                    *.zst)  DECOMPRESS="zstdcat" ;;
+                    *.xz)   DECOMPRESS="xzcat" ;;
+                    *.gz)   DECOMPRESS="zcat" ;;
+                    *)      DECOMPRESS="cat" ;;
+                esac
+                if $DECOMPRESS "$NATIVE_IPU_BRIDGE" 2>/dev/null | strings | grep -q "$DMI_PRODUCT"; then
+                    UPSTREAM_HAS_FIX=true
+                fi
+            fi
+
+            if $UPSTREAM_HAS_FIX; then
+                echo "  ✓ Native kernel ipu-bridge already has Samsung rotation fix — skipping DKMS"
+            else
+                # Remove old DKMS version if present
+                if dkms status "ipu-bridge-fix/${IPU_BRIDGE_FIX_VER}" 2>/dev/null | grep -q "ipu-bridge-fix"; then
+                    sudo dkms remove "ipu-bridge-fix/${IPU_BRIDGE_FIX_VER}" --all 2>/dev/null || true
+                fi
+
+                # Copy source to DKMS tree
+                sudo rm -rf "$IPU_BRIDGE_FIX_SRC"
+                sudo mkdir -p "$IPU_BRIDGE_FIX_SRC"
+                sudo cp -a "$IPU_BRIDGE_DIR/"* "$IPU_BRIDGE_FIX_SRC/"
+
+                # Secure Boot handling for Fedora
+                if [[ "$DISTRO" == "fedora" ]] && mokutil --sb-state 2>/dev/null | grep -q "SecureBoot enabled"; then
+                    MOK_KEY="/etc/pki/akmods/private/private_key.priv"
+                    MOK_CERT="/etc/pki/akmods/certs/public_key.der"
+                    if [[ -f "$MOK_KEY" ]] && [[ -f "$MOK_CERT" ]]; then
+                        sudo mkdir -p /etc/dkms/framework.conf.d
+                        sudo tee /etc/dkms/framework.conf.d/akmods-keys.conf > /dev/null << SIGNEOF
+# Fedora akmods MOK key for Secure Boot module signing
+mok_signing_key=${MOK_KEY}
+mok_certificate=${MOK_CERT}
+SIGNEOF
+                    fi
+                fi
+
+                # Register, build, install
+                echo "  Building ipu-bridge DKMS module..."
+                sudo dkms add "ipu-bridge-fix/${IPU_BRIDGE_FIX_VER}" 2>/dev/null || true
+                sudo dkms build "ipu-bridge-fix/${IPU_BRIDGE_FIX_VER}"
+                sudo dkms install "ipu-bridge-fix/${IPU_BRIDGE_FIX_VER}"
+                echo "  ✓ ipu-bridge-fix/${IPU_BRIDGE_FIX_VER} installed via DKMS"
+            fi
+        fi
+
+        # Install upstream check script and service
+        BOOK5_DIR="$SCRIPT_DIR/../webcam-fix-book5"
+        if [[ -f "$BOOK5_DIR/ipu-bridge-check-upstream.sh" ]]; then
+            sudo cp "$BOOK5_DIR/ipu-bridge-check-upstream.sh" /usr/local/sbin/ipu-bridge-check-upstream.sh
+            sudo chmod 755 /usr/local/sbin/ipu-bridge-check-upstream.sh
+            sudo cp "$BOOK5_DIR/ipu-bridge-check-upstream.service" /etc/systemd/system/ipu-bridge-check-upstream.service
+            sudo systemctl daemon-reload
+            sudo systemctl enable ipu-bridge-check-upstream.service
+            echo "  ✓ Upstream check service enabled (auto-removes fix when kernel catches up)"
+        fi
+
+        # Clean up temp download
+        rm -rf /tmp/ipu-bridge-fix
+    else
+        echo "  ⚠ Could not locate ipu-bridge fix files. Camera image may be upside-down."
+        echo "    Clone the full repo and re-run the installer to fix this."
+    fi
+else
+    echo "  ✓ No rotation fix needed for this model"
+fi
+
+# ──────────────────────────────────────────────
+# [9/14] Install/build libcamera
+# ──────────────────────────────────────────────
+echo ""
+echo "[9/14] Installing libcamera..."
 
 # Check if a sufficient version is already installed
 check_libcamera_version() {
@@ -446,6 +567,36 @@ build_libcamera_from_source() {
         https://git.libcamera.org/libcamera/libcamera.git "$LIBCAMERA_BUILD_DIR"
 
     cd "$LIBCAMERA_BUILD_DIR"
+
+    # Patch: Add OV02C10 CameraSensorHelper so IPASoft can properly control
+    # exposure and gain. Without this, auto-exposure uses a generic fallback
+    # that produces a very dark image.
+    HELPER_FILE="src/libcamera/sensor/camera_sensor_helper.cpp"
+    if [[ -f "$HELPER_FILE" ]] && ! grep -q "CameraSensorHelperOv02c10" "$HELPER_FILE"; then
+        echo "  Patching libcamera with OV02C10 sensor helper..."
+        cat >> "$HELPER_FILE" << 'PATCH_EOF'
+
+/*
+ * OmniVision OV02C10
+ *
+ * Analogue gain is linear with register value:
+ *   gain = code / 16
+ *   code 16 = 1.0x, code 248 = 15.5x
+ */
+class CameraSensorHelperOv02c10 : public CameraSensorHelper
+{
+public:
+	CameraSensorHelperOv02c10()
+	{
+		gainType_ = AnalogueGainLinear;
+		gainConstants_.linear = { 1, 0, 0, 16 };
+	}
+};
+REGISTER_CAMERA_SENSOR_HELPER("ov02c10", CameraSensorHelperOv02c10)
+PATCH_EOF
+        echo "  ✓ OV02C10 sensor helper patched"
+    fi
+
     meson setup build \
         -Dprefix=/usr/local \
         -Dpipelines=simple \
@@ -606,10 +757,10 @@ case "$DISTRO" in
 esac
 
 # ──────────────────────────────────────────────
-# [9/13] Install PipeWire libcamera plugin
+# [10/14] Install PipeWire libcamera plugin
 # ──────────────────────────────────────────────
 echo ""
-echo "[9/13] Installing PipeWire libcamera plugin..."
+echo "[10/14] Installing PipeWire libcamera plugin..."
 
 # On Ubuntu/Debian with source-built libcamera, the system PipeWire SPA plugin
 # links against the old system libcamera (0.2.x). We need to rebuild the SPA
@@ -714,10 +865,10 @@ case "$DISTRO" in
 esac
 
 # ──────────────────────────────────────────────
-# [10/13] Install sensor tuning and configure environment
+# [11/14] Install sensor tuning and configure environment
 # ──────────────────────────────────────────────
 echo ""
-echo "[10/13] Installing sensor tuning and environment config..."
+echo "[11/14] Installing sensor tuning and environment config..."
 
 # Install OV02C10 tuning file for libcamera Simple ISP
 for dir in /usr/local/share/libcamera/ipa/simple /usr/share/libcamera/ipa/simple; do
@@ -751,10 +902,10 @@ else
 fi
 
 # ──────────────────────────────────────────────
-# [11/13] Hide raw IPU6 nodes from PipeWire
+# [12/14] Hide raw IPU6 nodes from PipeWire
 # ──────────────────────────────────────────────
 echo ""
-echo "[11/13] Hiding raw IPU6 nodes from applications..."
+echo "[12/14] Hiding raw IPU6 nodes from applications..."
 
 # Remove session-level ACL from raw V4L2 nodes (keeps file permissions intact
 # so libcamera can still access them via the video group)
@@ -819,10 +970,10 @@ fi
 echo "  ✓ Raw IPU6 nodes hidden from applications"
 
 # ──────────────────────────────────────────────
-# [12/13] Camera relay tool (for non-PipeWire apps)
+# [13/14] Camera relay tool (for non-PipeWire apps)
 # ──────────────────────────────────────────────
 echo ""
-echo "[12/13] Installing camera relay tool..."
+echo "[13/14] Installing camera relay tool..."
 
 # Some apps (Zoom, OBS, VLC) don't support PipeWire/libcamera directly and
 # need a standard V4L2 device. The camera-relay tool creates an on-demand
@@ -944,10 +1095,10 @@ else
 fi
 
 # ──────────────────────────────────────────────
-# [13/13] Restart PipeWire and verify
+# [14/14] Restart PipeWire and verify
 # ──────────────────────────────────────────────
 echo ""
-echo "[13/13] Restarting PipeWire and verifying camera..."
+echo "[14/14] Restarting PipeWire and verifying camera..."
 
 # Restart PipeWire so it picks up the libcamera SPA plugin
 systemctl --user restart pipewire wireplumber 2>/dev/null || true

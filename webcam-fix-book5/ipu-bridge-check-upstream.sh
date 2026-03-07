@@ -32,7 +32,8 @@ decompress_module() {
     esac
 }
 
-if ! decompress_module "$NATIVE_MODULE" | strings | grep -q "940XHA"; then
+DMI_PRODUCT=$(cat /sys/class/dmi/id/product_name 2>/dev/null || echo "940XHA")
+if ! decompress_module "$NATIVE_MODULE" | strings | grep -q "$DMI_PRODUCT"; then
     log "In-tree ipu-bridge in $(uname -r) does not have Samsung rotation fix — DKMS still needed"
     exit 0
 fi

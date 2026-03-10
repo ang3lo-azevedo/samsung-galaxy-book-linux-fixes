@@ -126,25 +126,43 @@ detect_camera_name() {
 }
 
 detect_loopback_device() {
-    local dev driver_link
+    local dev driver_link card_name fallback_dev=""
+    # First pass: prefer exact "Camera Relay" label
     for dev in /sys/devices/virtual/video4linux/video*/name; do
         [[ -f "$dev" ]] || continue
-        # Check if this is a v4l2loopback device by looking at the driver
-        driver_link="$(dirname "$dev")/device/driver"
-        if [[ -L "$driver_link" ]] && [[ "$(readlink "$driver_link")" == *v4l2loopback* ]]; then
+        card_name=$(cat "$dev" 2>/dev/null)
+        if [[ "$card_name" == *"Camera Relay"* ]]; then
             echo "/dev/$(basename "$(dirname "$dev")")"
             return 0
         fi
-        # Fallback: match known v4l2loopback card labels
-        local card_name
-        card_name=$(cat "$dev" 2>/dev/null)
-        case "$card_name" in
-            *"Camera Relay"*|*"Loopback"*|*"v4l2loopback"*|*"Intel MIPI Camera"*)
+    done
+    # Second pass: any v4l2loopback device (but NOT v4l2loopback_dc / Droidcam)
+    for dev in /sys/devices/virtual/video4linux/video*/name; do
+        [[ -f "$dev" ]] || continue
+        driver_link="$(dirname "$dev")/device/driver"
+        if [[ -L "$driver_link" ]]; then
+            local driver_name
+            driver_name=$(readlink "$driver_link")
+            # Skip Droidcam's v4l2loopback_dc module
+            [[ "$driver_name" == *v4l2loopback_dc* ]] && continue
+            if [[ "$driver_name" == *v4l2loopback* ]]; then
                 echo "/dev/$(basename "$(dirname "$dev")")"
                 return 0
+            fi
+        fi
+        # Fallback: match known v4l2loopback card labels (excluding Droidcam/OBS)
+        card_name=$(cat "$dev" 2>/dev/null)
+        case "$card_name" in
+            *"Droidcam"*|*"OBS"*) continue ;;
+            *"Loopback"*|*"v4l2loopback"*|*"Intel MIPI Camera"*)
+                fallback_dev="/dev/$(basename "$(dirname "$dev")")"
                 ;;
         esac
     done
+    if [[ -n "$fallback_dev" ]]; then
+        echo "$fallback_dev"
+        return 0
+    fi
     return 1
 }
 

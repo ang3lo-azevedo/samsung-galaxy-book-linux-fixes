@@ -646,6 +646,15 @@ PATCH_EOF
 
     ninja -C build -j$(nproc)
     sudo ninja -C build install
+
+    # Ensure /usr/local/lib64 (Fedora) and /usr/local/lib (Ubuntu) are in the
+    # dynamic linker search path. Without this, 'cam' and gstreamer plugins
+    # fail with "cannot open shared object file" on Fedora where /usr/local/lib64
+    # is not in the default search path.
+    if [[ ! -f /etc/ld.so.conf.d/libcamera-local.conf ]]; then
+        echo "/usr/local/lib64" | sudo tee /etc/ld.so.conf.d/libcamera-local.conf > /dev/null
+        echo "/usr/local/lib/x86_64-linux-gnu" | sudo tee -a /etc/ld.so.conf.d/libcamera-local.conf > /dev/null
+    fi
     sudo ldconfig
 
     cd "$SCRIPT_DIR"

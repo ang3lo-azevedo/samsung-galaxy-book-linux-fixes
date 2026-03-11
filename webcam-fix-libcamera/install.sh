@@ -615,8 +615,18 @@ build_libcamera_from_source() {
     # Patch: Add OV02C10 CameraSensorHelper so IPASoft can properly control
     # exposure and gain. Without this, auto-exposure uses a generic fallback
     # that produces a very dark image.
-    HELPER_FILE="src/libcamera/sensor/camera_sensor_helper.cpp"
-    if [[ -f "$HELPER_FILE" ]] && ! grep -q "CameraSensorHelperOv02c10" "$HELPER_FILE"; then
+    # The helper file moved between libcamera versions:
+    #   <= 0.5.x: src/libcamera/sensor/camera_sensor_helper.cpp
+    #   >= 0.7.0: src/ipa/libipa/camera_sensor_helper.cpp
+    HELPER_FILE=""
+    for candidate in src/ipa/libipa/camera_sensor_helper.cpp \
+                     src/libcamera/sensor/camera_sensor_helper.cpp; do
+        if [[ -f "$candidate" ]]; then
+            HELPER_FILE="$candidate"
+            break
+        fi
+    done
+    if [[ -n "$HELPER_FILE" ]] && ! grep -q "CameraSensorHelperOv02c10" "$HELPER_FILE"; then
         echo "  Patching libcamera with OV02C10 sensor helper..."
         cat >> "$HELPER_FILE" << 'PATCH_EOF'
 
@@ -683,12 +693,12 @@ fi
 # If so, force a rebuild so the sensor helper gets patched in.
 check_sensor_helper() {
     local lib
-    lib=$(find /usr/local/lib -name "libcamera.so.0.7.*" -not -type l 2>/dev/null | head -1)
+    lib=$(find /usr/local/lib /usr/local/lib64 -name "libcamera.so.0.7.*" -not -type l 2>/dev/null | head -1)
     [[ -n "$lib" ]] && strings "$lib" | grep -q "CameraSensorHelperOv02c10"
 }
 
 if $LIBCAMERA_OK; then
-    local_lib=$(find /usr/local/lib -name "libcamera.so.0.*" -not -type l 2>/dev/null | head -1)
+    local_lib=$(find /usr/local/lib /usr/local/lib64 -name "libcamera.so.0.*" -not -type l 2>/dev/null | head -1)
     if [[ -n "$local_lib" ]] && ! check_sensor_helper 2>/dev/null; then
         echo "  ⚠ libcamera $LIBCAMERA_VER found but missing OV02C10 sensor helper — rebuild needed"
         LIBCAMERA_OK=false

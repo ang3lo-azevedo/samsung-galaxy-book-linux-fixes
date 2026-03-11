@@ -655,10 +655,22 @@ cmd_enable_persistent() {
     fi
 
     # Detect paths for the service environment
-    local ipa_path="" gst_path="" lib_path=""
+    local ipa_path="" gst_path="" lib_path="" softisp_mode=""
     ipa_path=$(detect_ipa_path 2>/dev/null) || true
     gst_path=$(detect_gst_plugin_path 2>/dev/null) || true
     lib_path=$(detect_libcamera_lib_path 2>/dev/null) || true
+
+    # Detect if NVIDIA is the active EGL renderer. libcamera 0.7.0's GPU debayer
+    # (debayer_egl.cpp) is incompatible with NVIDIA's proprietary EGL driver,
+    # causing black frames. Force CPU debayer on NVIDIA systems.
+    if command -v glxinfo &>/dev/null && glxinfo 2>/dev/null | grep -qi "opengl renderer.*nvidia"; then
+        softisp_mode="cpu"
+        info "NVIDIA GPU detected as active renderer — using CPU debayer"
+    elif [[ -d /proc/driver/nvidia ]] && \
+         ! { command -v prime-select &>/dev/null && [[ "$(prime-select query 2>/dev/null)" == "intel" ]]; }; then
+        softisp_mode="cpu"
+        info "NVIDIA GPU detected — using CPU debayer"
+    fi
 
     # Create systemd user service
     mkdir -p "$SERVICE_DIR"
@@ -676,6 +688,7 @@ RestartSec=5
 ${ipa_path:+Environment=LIBCAMERA_IPA_MODULE_PATH=$ipa_path}
 ${gst_path:+Environment=GST_PLUGIN_PATH=$gst_path}
 ${lib_path:+Environment=LD_LIBRARY_PATH=$lib_path}
+${softisp_mode:+Environment=LIBCAMERA_SOFTISP_MODE=$softisp_mode}
 
 [Install]
 WantedBy=default.target

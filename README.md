@@ -146,6 +146,7 @@ The Galaxy Book4/5 laptops have built-in dual array digital microphones (DMIC). 
 - **Samsung Galaxy Book5 Pro** — Speaker fix confirmed working, mic continues to work (community-confirmed)
 - **Samsung Galaxy Book5 Pro (940XHA)** — Fedora 43, webcam fix confirmed (correct colors + orientation with bayer fix)
 - **Samsung Galaxy Book5 Pro 16" (960XHA)** — Ubuntu 24.04, kernel 6.19.2, webcam fix confirmed (correct colors + orientation with bayer fix)
+- **Samsung Galaxy Book4 Pro 360 (960QGK)** — Ubuntu 24.04.2, kernel 6.17.0-19-generic, webcam fix confirmed (community-confirmed, [#18](https://github.com/Andycodeman/samsung-galaxy-book4-linux-fixes/issues/18))
 
 The upstream speaker PR (#5616) was also confirmed working on Galaxy Book4 Pro, Pro 360, and Book4 Pro 16-inch by other users, so this fix should work on those models too. If you try it on another model or distro, please report back.
 
@@ -183,3 +184,15 @@ Thanks to the following users for their contributions and testing:
 ## License
 
 [GPL-2.0](LICENSE) — Free to use, modify, and redistribute. Derivative works must use the same license.
+
+## Reporting Issues
+
+If you run into problems, please [open an issue](https://github.com/Andycodeman/samsung-galaxy-book4-linux-fixes/issues) with your distro, kernel version (`uname -r`), and laptop model. Logs from `dmesg` or `journalctl` are helpful for debugging.
+
+---
+
+*Last updated: 2026-03-16*
+
+this is a test
+test is a test too
+This is a 3rd test

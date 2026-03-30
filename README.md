@@ -1,6 +1,6 @@
-# Samsung Galaxy Book4/5 Linux Fixes
+# Samsung Galaxy Book 3/4/5 Linux Fixes
 
-Fixes for hardware that doesn't work out of the box on Linux on Samsung Galaxy Book4 and Book5 laptops. Confirmed working on **Galaxy Book4 Ultra** (Ubuntu, Fedora), **Book5 Pro 940XHA** (Fedora), and **Book5 Pro 960XHA** (Ubuntu) — should also work on Pro 360 and other models with the same hardware.
+Fixes for hardware that doesn't work out of the box on Linux on Samsung Galaxy Book 3, 4, and 5 laptops. Confirmed working on **Galaxy Book4 Ultra** (Ubuntu, Fedora), **Book4 Pro 360** (Ubuntu), **Book5 Pro 940XHA** (Fedora), **Book5 Pro 960XHA** (Ubuntu), and **Book5 Pro 360 960QHA** (Arch) — should also work on other models with the same hardware.
 
 > **Distro support:** The **speaker fix** works on Ubuntu, Fedora, and Arch-based distros (CachyOS, Manjaro, etc. — `dkms` and `linux-headers` must be installed first, see [speaker-fix README](speaker-fix/)). The **webcam fix** supports **Ubuntu, Fedora, and Arch-based distros** — see [webcam-fix-libcamera](webcam-fix-libcamera/) for Book3/Book4 (Meteor Lake / Raptor Lake) and [webcam-fix-book5](webcam-fix-book5/) for Book5 (Lunar Lake). Both use open-source libcamera + PipeWire with an on-demand camera relay for non-PipeWire apps.
 
@@ -15,7 +15,7 @@ Each fix can be downloaded and installed in a single command — no git required
 > **Microphone note (Book4 models):** On Galaxy Book4 (Meteor Lake), the built-in DMIC does not work with or without this fix — no mic functionality is lost. On **Galaxy Book5** (Lunar Lake), the speaker fix works and the **built-in mic continues to work** after installation. See [Microphone Status](#microphone-status) for details.
 
 ```bash
-curl -sL https://github.com/Andycodeman/samsung-galaxy-book4-linux-fixes/archive/refs/heads/main.tar.gz | tar xz && cd samsung-galaxy-book4-linux-fixes-main/speaker-fix && sudo ./install.sh && sudo reboot
+curl -sL https://github.com/Andycodeman/samsung-galaxy-book-linux-fixes/archive/refs/heads/main.tar.gz | tar xz && cd samsung-galaxy-book-linux-fixes-main/speaker-fix && sudo ./install.sh && sudo reboot
 ```
 
 To uninstall: `sudo ./uninstall.sh && sudo reboot`
@@ -25,7 +25,7 @@ To uninstall: `sudo ./uninstall.sh && sudo reboot`
 > Updates SOF (Sound Open Firmware) and sets `dsp_driver=3` to enable the internal DMIC. The stock `linux-firmware` on Ubuntu 24.04 ships SOF v2023.12.1 which is too old for Meteor Lake DMIC support. This pulls v2025.12.1+ from the upstream linux-firmware repo. **Note:** Fedora may already ship new enough firmware — check first with `sudo dmesg | grep "Booted firmware version"`.
 
 ```bash
-curl -sL https://github.com/Andycodeman/samsung-galaxy-book4-linux-fixes/archive/refs/heads/main.tar.gz | tar xz && cd samsung-galaxy-book4-linux-fixes-main/mic-fix && sudo ./install.sh && sudo reboot
+curl -sL https://github.com/Andycodeman/samsung-galaxy-book-linux-fixes/archive/refs/heads/main.tar.gz | tar xz && cd samsung-galaxy-book-linux-fixes-main/mic-fix && sudo ./install.sh && sudo reboot
 ```
 
 To uninstall: `sudo ./uninstall.sh && sudo reboot`
@@ -37,7 +37,7 @@ To uninstall: `sudo ./uninstall.sh && sudo reboot`
 > **Galaxy Book5 (Lunar Lake):** Use [webcam-fix-book5](webcam-fix-book5/) instead — the installer will detect Lunar Lake and direct you there.
 
 ```bash
-curl -sL https://github.com/Andycodeman/samsung-galaxy-book4-linux-fixes/archive/refs/heads/main.tar.gz | tar xz && cd samsung-galaxy-book4-linux-fixes-main/webcam-fix-libcamera && ./install.sh && sudo reboot
+curl -sL https://github.com/Andycodeman/samsung-galaxy-book-linux-fixes/archive/refs/heads/main.tar.gz | tar xz && cd samsung-galaxy-book-linux-fixes-main/webcam-fix-libcamera && ./install.sh && sudo reboot
 ```
 
 To uninstall: `./uninstall.sh && sudo reboot`
@@ -53,7 +53,7 @@ The webcam works with **Firefox, Chromium, Zoom, Teams, OBS, mpv, VLC**, and mos
 > **OV02E10 purple tint fix:** Samsung Book5 models with the OV02E10 sensor mounted upside-down get purple/magenta tint due to a bayer pattern mismatch after the rotation flip. A patched libcamera build fixes this — see [OV02E10 bayer fix](webcam-fix-book5/libcamera-bayer-fix/) and the [webcam-fix-book5 README](webcam-fix-book5/) for details.
 
 ```bash
-curl -sL https://github.com/Andycodeman/samsung-galaxy-book4-linux-fixes/archive/refs/heads/main.tar.gz | tar xz && cd samsung-galaxy-book4-linux-fixes-main/webcam-fix-book5 && ./install.sh && sudo reboot
+curl -sL https://github.com/Andycodeman/samsung-galaxy-book-linux-fixes/archive/refs/heads/main.tar.gz | tar xz && cd samsung-galaxy-book-linux-fixes-main/webcam-fix-book5 && ./install.sh && sudo reboot
 ```
 
 To uninstall: `./uninstall.sh && sudo reboot`
@@ -146,13 +146,17 @@ The Galaxy Book4/5 laptops have built-in dual array digital microphones (DMIC). 
 - **Samsung Galaxy Book5 Pro** — Speaker fix confirmed working, mic continues to work (community-confirmed)
 - **Samsung Galaxy Book5 Pro (940XHA)** — Fedora 43, webcam fix confirmed (correct colors + orientation with bayer fix)
 - **Samsung Galaxy Book5 Pro 16" (960XHA)** — Ubuntu 24.04, kernel 6.19.2, webcam fix confirmed (correct colors + orientation with bayer fix)
-- **Samsung Galaxy Book4 Pro 360 (960QGK)** — Ubuntu 24.04.2, kernel 6.17.0-19-generic, webcam fix confirmed (community-confirmed, [#18](https://github.com/Andycodeman/samsung-galaxy-book4-linux-fixes/issues/18))
+- **Samsung Galaxy Book4 Pro 360 (960QGK)** — Ubuntu 24.04.2, kernel 6.17.0-19-generic, webcam fix confirmed (community-confirmed, [#18](https://github.com/Andycodeman/samsung-galaxy-book-linux-fixes/issues/18))
+- **Samsung Galaxy Book5 Pro 360 (960QHA)** — Arch Linux, kernel 6.19.9, webcam fix confirmed (community-confirmed, [#22](https://github.com/Andycodeman/samsung-galaxy-book-linux-fixes/issues/22))
+- **Samsung Galaxy Book3 Pro 360 (960QFG)** — Ubuntu 24.04, webcam rotation fix confirmed (community-confirmed, [#17](https://github.com/Andycodeman/samsung-galaxy-book-linux-fixes/issues/17))
 
 The upstream speaker PR (#5616) was also confirmed working on Galaxy Book4 Pro, Pro 360, and Book4 Pro 16-inch by other users, so this fix should work on those models too. If you try it on another model or distro, please report back.
 
 **Note:** The Book3/Book4 webcam fix ([webcam-fix-libcamera](webcam-fix-libcamera/)) is for **Meteor Lake / Raptor Lake (IPU6)** and supports Ubuntu, Fedora, and Arch. Galaxy Book5 (Lunar Lake / IPU7) has a **[separate webcam fix](webcam-fix-book5/)** for Arch, Fedora, and Ubuntu. Both include an on-demand camera relay for non-PipeWire apps.
 
 ## Hardware
+
+**Galaxy Book3 / Book4 (Meteor Lake / Raptor Lake)**
 
 | Component | Details |
 |---|---|
@@ -161,6 +165,17 @@ The upstream speaker PR (#5616) was also confirmed working on Galaxy Book4 Pro, 
 | Camera ISP | Intel IPU6 Meteor Lake (`8086:7d19`) |
 | Camera Sensor | OmniVision OV02C10 (`OVTI02C1`) |
 | Microphones | Dual array DMIC (digital — status varies by model, see [Microphone Status](#microphone-status)) |
+
+**Galaxy Book5 (Lunar Lake)**
+
+| Component | Details |
+|---|---|
+| Audio Codec | Realtek ALC298 (same as Book4) |
+| Speaker Amps | 4x MAX98390 on I2C (same as Book4) |
+| Camera ISP | Intel IPU7 Lunar Lake (`8086:645d`) |
+| Camera Sensor | OmniVision OV02E10 (`OVTI02E1`) |
+| Camera Subsystem | Intel CVS (Computer Vision Subsystem) via LJCA |
+| Microphones | Dual array DMIC (works out of the box with SOF on Lunar Lake) |
 
 ## Community
 
@@ -187,12 +202,8 @@ Thanks to the following users for their contributions and testing:
 
 ## Reporting Issues
 
-If you run into problems, please [open an issue](https://github.com/Andycodeman/samsung-galaxy-book4-linux-fixes/issues) with your distro, kernel version (`uname -r`), and laptop model. Logs from `dmesg` or `journalctl` are helpful for debugging.
+If you run into problems, please [open an issue](https://github.com/Andycodeman/samsung-galaxy-book-linux-fixes/issues) with your distro, kernel version (`uname -r`), and laptop model. Logs from `dmesg` or `journalctl` are helpful for debugging.
 
 ---
 
-*Last updated: 2026-03-16*
-
-this is a test
-test is a test too
-This is a 3rd test
+*Last updated: 2026-03-30*

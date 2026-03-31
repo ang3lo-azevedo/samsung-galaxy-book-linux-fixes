@@ -183,6 +183,7 @@ Thanks to the following users for their contributions and testing:
 
 - **[@jn-simonnet](https://github.com/jn-simonnet)** and **[@david-bartlett](https://github.com/david-bartlett)** — Extensive testing across multiple Galaxy Book models, kernels, and distros that helped identify and resolve numerous issues
 - **[@MatiDegli](https://github.com/MatiDegli)** — Created [speaker-on/off/status helper scripts](https://github.com/Andycodeman/samsung-galaxy-book4-linux-fixes/discussions/4) for manually toggling the speaker fix on and off. Note: the driver already powers down the amps when idle, so this isn't needed for battery savings, but may be useful if you want to explicitly unload the modules. Community-contributed and not officially tested — use at your own discretion.
+- **[@pagliarinilucas](https://github.com/pagliarinilucas)** — NixOS module for the speaker fix (declarative kernel module build + I2C device setup). See [`nixos/`](nixos/).
 
 ## Credits
 
@@ -198,41 +199,7 @@ Thanks to the following users for their contributions and testing:
 
 ## NixOS
 
-NixOS users can use the provided Nix modules in the [`nixos/`](nixos/) directory instead of the DKMS install scripts.
-
-### Speaker Fix
-
-Two files are provided:
-
-- **`max98390-hda-module.nix`** — Nix derivation that builds the out-of-tree MAX98390 HDA kernel modules against your current kernel.
-- **`samsung-speaker-fix.nix`** — NixOS module that loads the kernel modules, creates a systemd service to detect and register I2C amplifier devices at boot, and installs `i2c-tools`.
-
-### Usage
-
-Add the speaker fix module to your NixOS configuration:
-
-```nix
-# configuration.nix (or your hardware module)
-{ ... }:
-{
-  imports = [
-    /path/to/samsung-galaxy-book4-linux-fixes/nixos/samsung-speaker-fix.nix
-  ];
-}
-```
-
-Then rebuild:
-
-```bash
-sudo nixos-rebuild switch
-```
-
-The module will:
-1. Build and install `snd-hda-scodec-max98390` and `snd-hda-scodec-max98390-i2c` kernel modules
-2. Load them at boot via `boot.kernelModules`
-3. Run a systemd oneshot service that scans the I2C bus for additional MAX98390 amplifiers and registers them
-
-> **Note:** The Nix derivation fetches the driver source directly from this repository. If the hash becomes outdated after an upstream update, you may need to update the `hash` field in `max98390-hda-module.nix`.
+NixOS users can use the declarative Nix modules in [`nixos/`](nixos/) instead of the DKMS install scripts. Import `nixos/samsung-speaker-fix.nix` in your `configuration.nix` and run `nixos-rebuild switch` — it builds the kernel modules from source, loads them at boot, and sets up I2C amplifier detection via systemd. See the module files for details. Contributed by [@pagliarinilucas](https://github.com/pagliarinilucas).
 
 ## License
 
@@ -244,4 +211,4 @@ If you run into problems, please [open an issue](https://github.com/Andycodeman/
 
 ---
 
-*Last updated: 2026-03-30*
+*Last updated: 2026-03-31*

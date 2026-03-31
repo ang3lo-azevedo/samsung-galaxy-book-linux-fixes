@@ -98,6 +98,7 @@ in
 
   # Load the modules at boot
   boot.kernelModules = [
+    "i2c-dev"
     "snd-hda-scodec-max98390"
     "snd-hda-scodec-max98390-i2c"
   ];

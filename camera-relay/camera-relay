@@ -296,7 +296,7 @@ setup_environment() {
     if ! gst-inspect-1.0 libcamerasrc &>/dev/null; then
         die "GStreamer 'libcamerasrc' element not found. Install it:
   Fedora:  sudo dnf install gstreamer1-plugins-bad-free-extras
-  Arch:    sudo pacman -S gst-plugins-bad
+  Arch:    sudo pacman -S gst-plugin-libcamera
   Ubuntu:  sudo apt install gstreamer1.0-plugins-bad"
     fi
 

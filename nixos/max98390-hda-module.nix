@@ -1,22 +1,35 @@
-{ stdenvNoCC, lib, kernel, fetchFromGitHub, llvmPackages, gcc }:
+{
+  stdenvNoCC,
+  lib,
+  kernel,
+  fetchFromGitHub,
+  llvmPackages,
+  gcc,
+  sourceType ? "github",
+  localSrc ? ../speaker-fix/src,
+  githubOwner ? "Andycodeman",
+  githubRepo ? "samsung-galaxy-book-linux-fixes",
+  githubRev ? "v0.3.26",
+  githubHash ? "sha256-THezjEOxkaVnFY72zQyK2ER5VunOROm+i72JtSFCeMA=",
+}:
 
 let
   kernelUsesClang = (kernel.stdenv.cc.isClang or false);
   cc = if kernelUsesClang then llvmPackages.clang-unwrapped else gcc;
+  src = if sourceType == "local" then localSrc else fetchFromGitHub {
+    owner = githubOwner;
+    repo = githubRepo;
+    rev = githubRev;
+    hash = githubHash;
+  };
 in
 
 stdenvNoCC.mkDerivation {
   pname = "max98390-hda";
   version = "1.0-${kernel.version}";
 
-  src = fetchFromGitHub {
-    owner = "Andycodeman";
-    repo = "samsung-galaxy-book-linux-fixes";
-    rev = "v0.3.26";
-    hash = "sha256-THezjEOxkaVnFY72zQyK2ER5VunOROm+i72JtSFCeMA=";
-  };
-
-  sourceRoot = "source/speaker-fix/src";
+  inherit src;
+  sourceRoot = lib.optionalString (sourceType == "github") "source/speaker-fix/src";
 
   nativeBuildInputs =
     kernel.moduleBuildDependencies

@@ -1,10 +1,20 @@
 { pkgs, config, ... }:
 
 let
+  lib = pkgs.lib;
+  cfg = config.hardware.samsungGalaxyBook.speakerFix;
+
   kernelPackages = config.boot.kernelPackages;
 
   # Out-of-tree kernel module for MAX98390 HDA speaker amplifier
-  max98390-hda = kernelPackages.callPackage ./max98390-hda-module.nix { };
+  max98390-hda = kernelPackages.callPackage ./max98390-hda-module.nix {
+    sourceType = cfg.source;
+    localSrc = cfg.localSrc;
+    githubOwner = cfg.githubOwner;
+    githubRepo = cfg.githubRepo;
+    githubRev = cfg.githubRev;
+    githubHash = cfg.githubHash;
+  };
 
   # I2C setup script to create devices for additional amplifiers
   i2cSetupScript = pkgs.writeShellScript "max98390-hda-i2c-setup" ''
@@ -93,6 +103,44 @@ let
   '';
 in
 {
+  options.hardware.samsungGalaxyBook.speakerFix = {
+    source = lib.mkOption {
+      type = lib.types.enum [ "github" "local" ];
+      default = "github";
+      description = "Source for building the MAX98390 speaker modules.";
+    };
+
+    localSrc = lib.mkOption {
+      type = lib.types.path;
+      default = ../speaker-fix/src;
+      description = "Local path used when source is set to local.";
+    };
+
+    githubOwner = lib.mkOption {
+      type = lib.types.str;
+      default = "Andycodeman";
+      description = "GitHub owner used when source is set to github.";
+    };
+
+    githubRepo = lib.mkOption {
+      type = lib.types.str;
+      default = "samsung-galaxy-book-linux-fixes";
+      description = "GitHub repository used when source is set to github.";
+    };
+
+    githubRev = lib.mkOption {
+      type = lib.types.str;
+      default = "v0.3.26";
+      description = "Git revision or tag used when source is set to github.";
+    };
+
+    githubHash = lib.mkOption {
+      type = lib.types.str;
+      default = "sha256-THezjEOxkaVnFY72zQyK2ER5VunOROm+i72JtSFCeMA=";
+      description = "Content hash for the GitHub source tarball.";
+    };
+  };
+
   # Build and install the out-of-tree kernel modules
   boot.extraModulePackages = [ max98390-hda ];
 

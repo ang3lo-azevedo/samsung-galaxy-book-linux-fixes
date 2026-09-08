@@ -12,9 +12,9 @@
 
 let
   cfg = config.hardware.samsungGalaxyBook.webcamFixBook5;
-  kernelPackages = config.boot.kernelPackages;
-  kernel = kernelPackages.kernel;
-  kernelUsesClang = (kernel.stdenv.cc.isClang or false);
+  inherit (config.boot) kernelPackages;
+  inherit (kernelPackages) kernel;
+  kernelUsesClang = kernel.stdenv.cc.isClang or false;
   cc = if kernelUsesClang then pkgs.llvmPackages.clang-unwrapped else pkgs.gcc;
   clangMakeFlags = lib.optionalString kernelUsesClang "LLVM=1 CC=${cc}/bin/clang LD=${pkgs.llvmPackages.lld}/bin/ld.lld";
 
@@ -330,38 +330,42 @@ in
     _: _: {pipewire = cfg.nixpkgsUnpatched.pipewire;}
   );
 
-  boot.initrd.kernelModules = [
-    "usb_ljca"
-    "gpio_ljca"
-    "intel_cvs"
-    "ipu-bridge"
-  ];
+  boot = {
+    initrd.kernelModules = [
+      "usb_ljca"
+      "gpio_ljca"
+      "intel_cvs"
+      "ipu-bridge"
+    ];
 
-  boot.kernelModules = [
-    "usb_ljca"
-    "gpio_ljca"
-    "intel_cvs"
-    "ipu-bridge"
-    "v4l2loopback"
-  ];
+    kernelModules = [
+      "usb_ljca"
+      "gpio_ljca"
+      "intel_cvs"
+      "ipu-bridge"
+      "v4l2loopback"
+    ];
 
-  boot.extraModulePackages = [
-    intelCvsModule
-    ipuBridgeModule
-    kernelPackages.v4l2loopback
-  ];
-
-  environment.systemPackages = [ cameraRelay ];
-  environment.sessionVariables = {
-    LIBCAMERA_IPA_MODULE_PATH = "${pkgs.libcamera}/lib/libcamera/ipa";
-  } // lib.optionalAttrs cfg.videoFlip {
-    # Consumed by the bundled libcamera bayer-fix patch only when sensor
-    # model is exactly "ov02e10" — strict opt-in, no effect on other
-    # sensors or systems where the env var isn't set.
-    LIBCAMERA_FORCE_OV02E10_ROTATION = "180";
+    extraModulePackages = [
+      intelCvsModule
+      ipuBridgeModule
+      kernelPackages.v4l2loopback
+    ];
   };
 
-  environment.etc = {
+  environment = {
+    systemPackages = [ cameraRelay ];
+
+    sessionVariables = {
+      LIBCAMERA_IPA_MODULE_PATH = "${pkgs.libcamera}/lib/libcamera/ipa";
+    } // lib.optionalAttrs cfg.videoFlip {
+      # Consumed by the bundled libcamera bayer-fix patch only when sensor
+      # model is exactly "ov02e10" — strict opt-in, no effect on other
+      # sensors or systems where the env var isn't set.
+      LIBCAMERA_FORCE_OV02E10_ROTATION = "180";
+    };
+
+    etc = {
     "modules-load.d/intel-ipu7-camera.conf".text = ''
       # IPU7 camera module chain for Lunar Lake
       # LJCA provides GPIO/USB control for the vision subsystem
@@ -388,36 +392,40 @@ in
   } // lib.optionalAttrs (!wireplumberUsesConf) {
     "wireplumber/main.lua.d/51-disable-ipu7-v4l2.lua".text = wireplumberLuaRule;
   };
+  };
 
-  systemd.user.services.camera-relay = {
-    description = "Camera Relay (on-demand libcamera to v4l2loopback)";
-    after = [ "pipewire.service" "wireplumber.service" ];
-    wantedBy = [ "default.target" ];
-    serviceConfig = {
-      Type = "simple";
-      ExecStart = "${cameraRelay}/bin/camera-relay start --on-demand";
-      ExecStop = "${cameraRelay}/bin/camera-relay stop";
-      Restart = "on-failure";
-      RestartSec = 5;
+  systemd.user.services = {
+    camera-relay = {
+      description = "Camera Relay (on-demand libcamera to v4l2loopback)";
+      after = [ "pipewire.service" "wireplumber.service" ];
+      wantedBy = [ "default.target" ];
+      serviceConfig = {
+        Type = "simple";
+        ExecStart = "${cameraRelay}/bin/camera-relay start --on-demand";
+        ExecStop = "${cameraRelay}/bin/camera-relay stop";
+        Restart = "on-failure";
+        RestartSec = 5;
+      };
+      environment = cameraRelayServiceEnvironment // lib.optionalAttrs cfg.videoFlip {
+        LIBCAMERA_FORCE_OV02E10_ROTATION = "180";
+      } // lib.optionalAttrs (cfg.relayColorFilter != "") {
+        RELAY_COLOR_FILTER = cfg.relayColorFilter;
+      };
     };
-    environment = cameraRelayServiceEnvironment // lib.optionalAttrs cfg.videoFlip {
+
+    # Also push LIBCAMERA_FORCE_OV02E10_ROTATION onto PipeWire/WirePlumber so
+    # libcamera-direct apps (Firefox with PipeWire WebRTC, GNOME Snapshot,
+    # etc.) get the rotation override. environment.sessionVariables flows
+    # to user systemd via PAM session import on next login, but explicit
+    # service env makes the fix take effect immediately after rebuild +
+    # `systemctl --user restart pipewire wireplumber`.
+    pipewire.environment = lib.optionalAttrs cfg.videoFlip {
       LIBCAMERA_FORCE_OV02E10_ROTATION = "180";
-    } // lib.optionalAttrs (cfg.relayColorFilter != "") {
-      RELAY_COLOR_FILTER = cfg.relayColorFilter;
     };
-  };
 
-  # Also push LIBCAMERA_FORCE_OV02E10_ROTATION onto PipeWire/WirePlumber so
-  # libcamera-direct apps (Firefox with PipeWire WebRTC, GNOME Snapshot,
-  # etc.) get the rotation override. environment.sessionVariables flows
-  # to user systemd via PAM session import on next login, but explicit
-  # service env makes the fix take effect immediately after rebuild +
-  # `systemctl --user restart pipewire wireplumber`.
-  systemd.user.services.pipewire.environment = lib.optionalAttrs cfg.videoFlip {
-    LIBCAMERA_FORCE_OV02E10_ROTATION = "180";
-  };
-  systemd.user.services.wireplumber.environment = lib.optionalAttrs cfg.videoFlip {
-    LIBCAMERA_FORCE_OV02E10_ROTATION = "180";
+    wireplumber.environment = lib.optionalAttrs cfg.videoFlip {
+      LIBCAMERA_FORCE_OV02E10_ROTATION = "180";
+    };
   };
   };
 }

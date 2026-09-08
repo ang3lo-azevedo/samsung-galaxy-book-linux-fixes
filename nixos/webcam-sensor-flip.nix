@@ -2,7 +2,7 @@
 # upside down but whose rotation is never reported to userspace, so apps
 # show the image 180 degrees off. This affects convertible models (NP960QHA,
 # NP960QFG, NP960QGK, ...) where the bundled ipu-bridge kernel module
-# override does not engage — for example when running the native in-tree
+# override does not engage, e.g. when running the native in-tree
 # intel-ipu7 stack without the webcam-fix-book5 libcamera relay.
 #
 # Instead of touching libcamera, this applies the flip at the V4L2 subdev

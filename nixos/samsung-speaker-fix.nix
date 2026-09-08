@@ -8,7 +8,8 @@ let
 
   # Out-of-tree kernel module for MAX98390 HDA speaker amplifier
   max98390-hda = kernelPackages.callPackage ./max98390-hda-module.nix {
-    inherit (cfg) sourceType localSrc githubOwner githubRepo githubRev githubHash;
+    inherit (cfg) localSrc githubOwner githubRepo githubRev githubHash;
+    sourceType = cfg.source;
   };
 
   # I2C setup script to create devices for additional amplifiers

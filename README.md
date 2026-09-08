@@ -59,13 +59,13 @@ curl -sL https://github.com/Andycodeman/samsung-galaxy-book-linux-fixes/archive/
 
 To uninstall: `./uninstall.sh && sudo reboot`
 
-The webcam works with **Firefox, Chromium, Zoom, Teams, OBS, mpv, VLC**, and most other apps. For Chromium-based browsers (Brave, Chrome), the installer automatically enables the PipeWire camera flag.
+The webcam works with **Firefox, Chromium, Zoom, Teams, OBS, mpv, VLC**, and most other apps. Chromium-based browsers (Chrome, Brave) cannot see the camera relay over V4L2 and need the PipeWire camera flag; the installer sets it for you when the browser is closed during install and libcamera is 0.7+.
 
 ### Webcam Fix (built-in camera not detected) — Lunar Lake / Galaxy Book5 / Arch, Fedora & Ubuntu
 
 > Confirmed working on Samsung Galaxy Book5 Pro 940XHA (Fedora 43), 960XHA (Ubuntu 24.04), Dell XPS 13 9350 (Arch), and Lenovo X1 Carbon Gen13 (Fedora). See the [full README](webcam-fix-book5/) for details, known issues, and tested hardware.
 
-> **Requires kernel 6.18+** and **Arch, Fedora, or Ubuntu** (Ubuntu requires libcamera 0.5.2+ and kernel 6.18+ built from source). Includes an on-demand camera relay for non-PipeWire apps (Zoom, OBS, VLC) with near-zero idle CPU usage. For Chromium-based browsers (Brave, Chrome), the installer automatically enables the PipeWire camera flag.
+> **Requires kernel 6.18+** and **Arch, Fedora, or Ubuntu** (Ubuntu requires libcamera 0.5.2+ and kernel 6.18+ built from source). Includes an on-demand camera relay for non-PipeWire apps (Zoom, OBS, VLC) with near-zero idle CPU usage. Chromium-based browsers (Chrome, Brave) cannot see that relay over V4L2 and need the PipeWire camera flag; the installer sets it for you when the browser is closed during install and libcamera is 0.7+.
 
 > **OV02E10 purple tint fix:** Samsung Book5 models with the OV02E10 sensor mounted upside-down get purple/magenta tint due to a bayer pattern mismatch after the rotation flip. A patched libcamera build fixes this — see [OV02E10 bayer fix](webcam-fix-book5/libcamera-bayer-fix/) and the [webcam-fix-book5 README](webcam-fix-book5/) for details.
 
@@ -88,9 +88,9 @@ The internal speakers use 4x Maxim MAX98390 I2C amplifiers that have no kernel d
 - Loads DSM firmware with separate woofer/tweeter configurations
 - Auto-detects and removes itself when native kernel support lands
 
-> **Sound Quality:** Audio will sound thinner and lack bass compared to Windows. This is because Windows uses Samsung's DSP audio processing (Dolby Atmos, bass enhancement, EQ) which Linux doesn't have. See [Sound Quality & EQ](speaker-fix/README.md#sound-quality--eq) for details and a workaround using EasyEffects.
+> **Sound Quality:** Audio will sound thinner and have less bass than Windows. This is because Windows uses Samsung's DSP audio processing (Dolby Atmos, bass enhancement, EQ) which Linux doesn't have. See [Sound Quality & EQ](speaker-fix/README.md#sound-quality--eq) for details and a workaround using EasyEffects. If the woofers produce **no** bass at all and an EQ makes no difference, that's a separate problem — see [Troubleshooting](speaker-fix/README.md#troubleshooting).
 
-> **Battery Impact:** The speaker amps are only powered on during active audio playback — when idle, they draw ~10μA per chip (effectively zero battery impact). The driver uses HDA playback hooks to enable the amps on demand.
+> **Battery Impact:** The speaker amps are enabled when the driver probes and stay on — they are **not** powered down when idle. The driver implements an HDA playback hook for on-demand power, but it never fires: it needs an in-kernel alc269 quirk that doesn't exist for these boards, so the HDA component never binds. Enabling the amps at probe is what makes the speakers work at all. See [`speaker-fix/README.md`](speaker-fix/README.md#power-management) for the full explanation.
 
 > **Secure Boot:** Most laptops have Secure Boot enabled. If you've never installed a DKMS/out-of-tree kernel module before, you'll need to do a **one-time MOK key enrollment** (reboot + blue screen + password) before the modules will load. See the [full walkthrough](speaker-fix/README.md#secure-boot-setup).
 
@@ -126,11 +126,11 @@ The internal DMIC requires SOF (Sound Open Firmware) with a recent enough firmwa
 
 ### [Webcam Fix — Book3 / Book4](webcam-fix-libcamera/) — IPU6 + libcamera (Recommended)
 
-The built-in webcam uses Intel IPU6 (Meteor Lake or Raptor Lake) with an OmniVision OV02C10 sensor. This fix uses the open-source libcamera Simple pipeline handler with Software ISP, accessed through PipeWire. Includes IVSC module loading, initramfs configuration (eliminating the boot race condition), sensor tuning, WirePlumber rules to hide raw IPU6 nodes, and an on-demand camera relay for non-PipeWire apps (Zoom, OBS, VLC). The installer also auto-detects the [26 MHz clock issue](ov02c10-26mhz-fix/) affecting some Raptor Lake models and offers to install the DKMS fix.
+The built-in webcam uses Intel IPU6 (Meteor Lake or Raptor Lake) with an OmniVision OV02C10 sensor. This fix uses the open-source libcamera Simple pipeline handler with Software ISP, accessed through PipeWire. Includes IVSC module loading, initramfs configuration (eliminating the boot race condition), sensor tuning, WirePlumber rules to hide raw IPU6 nodes, and an on-demand camera relay for non-PipeWire apps (Zoom, OBS, VLC). The installer also auto-detects the [26 MHz clock issue](ov02c10-26mhz-fix/) — which affects individual boards on both Raptor Lake and Meteor Lake, so it is detected from the dmesg error rather than from the platform — and offers to install the DKMS fix.
 
 - PipeWire-native apps (Firefox, Chromium) access the camera directly — no relay needed
 - Non-PipeWire apps use the on-demand V4L2 relay: near-zero CPU when idle, camera activates only when an app opens the device
-- Chromium browser PipeWire camera flags are auto-enabled during install
+- Chromium-family browsers are filtered out of the relay's V4L2 node by their own capability check, so the installer enables the PipeWire camera flag for them (browser must be closed; libcamera 0.7+)
 
 > **Multi-distro:** Supports **Ubuntu, Fedora, and Arch-based distros**. The install script auto-detects your distro. Galaxy Book5 (Lunar Lake / IPU7) is not supported (different driver stack) — see [webcam-fix-book5](webcam-fix-book5/).
 
@@ -140,7 +140,7 @@ For Galaxy Book5 (Lunar Lake / IPU7) on Arch, Fedora, and Ubuntu (source build).
 
 - PipeWire-native apps (Firefox, Chromium) access the camera directly
 - Non-PipeWire apps (Zoom, OBS, VLC) use the on-demand V4L2 relay: near-zero CPU when idle, camera activates only when an app opens the device
-- Chromium browser PipeWire camera flags are auto-enabled during install
+- Chromium-family browsers are filtered out of the relay's V4L2 node by their own capability check, so the installer enables the PipeWire camera flag for them (browser must be closed; libcamera 0.7+)
 
 For Samsung Book5 models with the OV02E10 sensor, an additional [patched libcamera build](webcam-fix-book5/libcamera-bayer-fix/) is needed to fix the purple/magenta tint caused by bayer pattern mismatch after rotation flip. See the [webcam-fix-book5 README](webcam-fix-book5/) for details.
 
@@ -175,6 +175,7 @@ The Galaxy Book4/5 laptops have built-in dual array digital microphones (DMIC). 
 
 - **Samsung Galaxy Book4 Ultra** — Ubuntu 24.04 LTS, kernel 6.17.0-14-generic (HWE)
 - **Samsung Galaxy Book4 Ultra** — Fedora 43, kernel 6.18.9 (community-confirmed)
+- **Samsung Galaxy Book4 Ultra (NP960XGL-XG1BR)** — Kubuntu 26.04, kernel 7.0.0-28-generic, speaker + webcam fix and camera relay confirmed under **Secure Boot** (all DKMS modules MOK-signed). Meteor Lake IPU6, but this board still needed the [26 MHz clock fix](ov02c10-26mhz-fix/) — note the SKU: another 960XGL on the same platform does not. The internal mic worked without the [mic fix](mic-fix/) — kernel 7.0 already selects the SOF driver and exposes the DMIC
 - **Samsung Galaxy Book4 Pro** — Ubuntu 25.10, kernel 6.18.7, speaker fix confirmed (community-confirmed)
 - **Samsung Galaxy Book5 Pro** — Speaker fix confirmed working, mic continues to work (community-confirmed)
 - **Samsung Galaxy Book5 Pro (940XHA)** — Fedora 43, webcam fix confirmed (correct colors + orientation with bayer fix)
@@ -229,7 +230,7 @@ The upstream speaker PR (#5616) was also confirmed working on Galaxy Book4 Pro, 
 Thanks to the following users for their contributions and testing:
 
 - **[@jn-simonnet](https://github.com/jn-simonnet)** and **[@david-bartlett](https://github.com/david-bartlett)** — Extensive testing across multiple Galaxy Book models, kernels, and distros that helped identify and resolve numerous issues
-- **[@MatiDegli](https://github.com/MatiDegli)** — Created [speaker-on/off/status helper scripts](https://github.com/Andycodeman/samsung-galaxy-book-linux-fixes/discussions/4) for manually toggling the speaker fix on and off. Note: the driver already powers down the amps when idle, so this isn't needed for battery savings, but may be useful if you want to explicitly unload the modules. Community-contributed and not officially tested — use at your own discretion.
+- **[@MatiDegli](https://github.com/MatiDegli)** — Created [speaker-on/off/status helper scripts](https://github.com/Andycodeman/samsung-galaxy-book-linux-fixes/discussions/4) for manually toggling the speaker fix on and off. These are genuinely useful for battery: the driver enables the amps at probe and never powers them down (the HDA playback hook can't fire without the missing alc269 quirk), so unloading the modules is currently the only way to switch the amps off. Community-contributed and not officially tested — use at your own discretion.
 - **[@pagliarinilucas](https://github.com/pagliarinilucas)** — NixOS module for the speaker fix (declarative kernel module build + I2C device setup). See [`nixos/`](nixos/).
 - **[@derwismtz](https://github.com/derwismtz)** — Tireless testing and Windows trace work that made the Book3 Pro 14" (NP940XFG) speaker fix possible. See [`speaker-fix-940xfg/`](speaker-fix-940xfg/) and [#44](https://github.com/Andycodeman/samsung-galaxy-book-linux-fixes/issues/44).
 - **[@ang3lo-azevedo](https://github.com/ang3lo-azevedo)** — Created the NixOS module for the Book5 webcam fix and helped test/verify the IPU7 CachyOS kernel compatibility.

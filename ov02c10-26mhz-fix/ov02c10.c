@@ -39,6 +39,51 @@ devm_v4l2_sensor_clk_get(struct device *dev, const char *id)
 #define OV02C10_MCLK_26MHZ		26000000
 #define OV02C10_RGB_DEPTH		10
 
+/*
+ * PLL registers. The mode register lists set 0x0303 (divider) and the 16-bit
+ * multiplier 0x0304:0x0305, and were computed upstream for a 19.2MHz MCLK.
+ * This DKMS package widens the clock-acceptance check to allow 26MHz boards
+ * (Raptor Lake) but does NOT re-time the PLL — so on those boards the whole
+ * sensor clock tree runs 26/19.2 = ~1.354x fast: ~40.7fps instead of 30, and
+ * the link_freq/pixel_rate we advertise to libcamera no longer match reality,
+ * which makes AGC mis-compute exposure. See issue #71.
+ *
+ * These parameters exist to find the correct 26MHz multiplier empirically,
+ * without a datasheet. Both default to -1 = "leave the mode's values alone",
+ * so the driver's behaviour is unchanged unless you opt in.
+ *
+ *   modprobe ov02c10 pll_mult=295
+ *
+ * If frame rate scales inversely with pll_mult, 0x0304:0x0305 is confirmed as
+ * the multiplier, and the right value for a 26MHz board is the one that lands
+ * at 30fps (predicted: 400 * 19.2/26 ~= 295).
+ */
+#define OV02C10_REG_PLL_DIV		CCI_REG8(0x0303)
+#define OV02C10_REG_PLL_MULT		CCI_REG16(0x0304)
+#define OV02C10_REG_PLL2_MULT		CCI_REG8(0x0316)
+
+/*
+ * Testing on a 26MHz board (issue #71) showed 0x0304:0x0305 is the *MIPI/link*
+ * PLL, not the pixel PLL: sweeping it 400 -> 295 left the frame rate pinned at
+ * 40.70fps, while values below ~64 (in 0x0305) starved the CSI-2 link — first
+ * corrupting frames, then stopping them entirely. Frame timing is therefore
+ * driven by the other multiplier the mode list writes, 0x0316 (also 0x90).
+ */
+static int pll_mult = -1;
+module_param(pll_mult, int, 0644);
+MODULE_PARM_DESC(pll_mult,
+	"Override MIPI/link PLL multiplier (0x0304:0x0305). -1 = use the mode's value (default). Does NOT affect frame rate. Experimental, see issue #71.");
+
+static int pll_div = -1;
+module_param(pll_div, int, 0644);
+MODULE_PARM_DESC(pll_div,
+	"Override PLL divider (0x0303). -1 = use the mode's value (default). Experimental, see issue #71.");
+
+static int pll2_mult = -1;
+module_param(pll2_mult, int, 0644);
+MODULE_PARM_DESC(pll2_mult,
+	"Override system/pixel PLL multiplier (0x0316). -1 = use the mode's value (default, 0x90=144). This is the one that should drive frame rate. Experimental, see issue #71.");
+
 #define OV02C10_REG_CHIP_ID		CCI_REG16(0x300a)
 #define OV02C10_CHIP_ID			0x5602
 
@@ -69,6 +114,81 @@ devm_v4l2_sensor_clk_get(struct device *dev, const char *id)
 #define OV02C10_DGTL_GAIN_MAX		0x3fff
 #define OV02C10_DGTL_GAIN_STEP		1
 #define OV02C10_DGTL_GAIN_DEFAULT	0x0400
+
+/*
+ * Low-noise profile — the same fix confirmed on the sibling OV02E10 in #67.
+ *
+ * In a dim room libcamera's AGC drives ANALOG gain to its 15.5x maximum, which
+ * amplifies the sensor's column fixed-pattern noise along with the signal. On
+ * OV02E10 that shows up as vertical banding; here it is more likely to read as
+ * general "dancing" noise and grain.
+ *
+ * The soft IPA reads againMax straight out of this V4L2 control's range at
+ * configure() time (soft_simple.cpp:224), and its AGC has no tunable target and
+ * no gain limit of its own — so the driver's gain ceiling IS AGC's gain ceiling.
+ * Cap analog gain, then make the brightness back up with DIGITAL gain, which
+ * amplifies signal and noise together downstream of the analog column chain and
+ * so does not reintroduce the noise it was hiding.
+ *
+ * Verified at matched brightness on OV02E10 (#67): 4x analog + 4x digital gives
+ * the same overall brightness as 15.5x analog, with the FPN gone.
+ *
+ * Both default to 0 = stock, so nothing changes unless you opt in.
+ *
+ *   modprobe ov02c10 max_again=64 dgain=4096      # 4x analog, 4x digital
+ */
+static int max_again;
+module_param(max_again, int, 0644);
+MODULE_PARM_DESC(max_again,
+	"Cap analog gain in raw units (16=1x, 64=4x, 248=15.5x). 0 = stock (248). See issue #67.");
+
+static int dgain;
+module_param(dgain, int, 0644);
+MODULE_PARM_DESC(dgain,
+	"Default digital gain (1024=1x, 4096=4x). 0 = stock (1024). Use with max_again to restore brightness. See issue #67.");
+
+static u32 ov02c10_again_max(void)
+{
+	if (max_again >= OV02C10_ANAL_GAIN_MIN && max_again <= OV02C10_ANAL_GAIN_MAX)
+		return max_again;
+	return OV02C10_ANAL_GAIN_MAX;
+}
+
+/*
+ * Cap on the exposure ceiling AGC is allowed to reach, in sensor lines.
+ * DIAGNOSTIC for the bright-light white-out in issue #71.
+ *
+ * libcamera's soft AGC is supposed to reduce exposure when a scene is too
+ * bright, but on this setup it drops gain to minimum and then leaves exposure
+ * pinned at its maximum, blowing the image to pure white. The higher that
+ * maximum is, the worse the blow-out — and padding VTS for the 30fps fix raised
+ * it (2320 -> 3144 lines). This lets us test whether capping the ceiling below
+ * the padded frame length restores a usable bright-light image *without* giving
+ * up the 30fps timing (the two are otherwise coupled through VTS).
+ *
+ * Applied wherever exposure_max is derived. 0 = no cap (default).
+ *
+ *   modprobe ov02c10 max_exp=2320
+ */
+static int max_exp;
+module_param(max_exp, int, 0644);
+MODULE_PARM_DESC(max_exp,
+	"Cap the exposure ceiling in sensor lines, independent of frame rate. 0 = no cap (default). Diagnostic for the bright-light white-out, see issue #71.");
+
+/* Apply the max_exp cap to a computed exposure ceiling. */
+static s64 ov02c10_cap_exposure(s64 exposure_max)
+{
+	if (max_exp > 0 && max_exp < exposure_max)
+		return max_exp;
+	return exposure_max;
+}
+
+static u32 ov02c10_dgain_default(void)
+{
+	if (dgain >= OV02C10_DGTL_GAIN_MIN && dgain <= OV02C10_DGTL_GAIN_MAX)
+		return dgain;
+	return OV02C10_DGTL_GAIN_DEFAULT;
+}
 
 /* Rotate */
 #define OV02C10_ROTATE_CONTROL		CCI_REG8(0x3820)
@@ -410,6 +530,9 @@ struct ov02c10 {
 	/* MIPI lane info */
 	u32 link_freq_index;
 	u8 mipi_lanes;
+
+	/* Actual external clock. 19.2MHz upstream, 26MHz on Raptor Lake. */
+	unsigned long mclk_freq;
 };
 
 static inline struct ov02c10 *to_ov02c10(struct v4l2_subdev *subdev)
@@ -444,6 +567,7 @@ static int ov02c10_set_ctrl(struct v4l2_ctrl *ctrl)
 	if (ctrl->id == V4L2_CID_VBLANK) {
 		/* Update max exposure while meeting expected vblanking */
 		exposure_max = height + ctrl->val - OV02C10_EXPOSURE_MAX_MARGIN;
+		exposure_max = ov02c10_cap_exposure(exposure_max);
 		__v4l2_ctrl_modify_range(ov02c10->exposure,
 					 ov02c10->exposure->minimum,
 					 exposure_max, ov02c10->exposure->step,
@@ -507,6 +631,24 @@ static const struct v4l2_ctrl_ops ov02c10_ctrl_ops = {
 	.s_ctrl = ov02c10_set_ctrl,
 };
 
+/*
+ * The frame length (VTS) this mode should use, corrected for the actual external
+ * clock. Used by both init_controls() and set_fmt() — set_fmt resets VBLANK to
+ * the default on every call, so if only one of them applied the correction the
+ * other would silently undo it. (issue #71)
+ */
+static u32 ov02c10_vts_def(struct ov02c10 *ov02c10,
+			   const struct ov02c10_mode *mode)
+{
+	u32 vts_def = mode->vts_min * ov02c10->mipi_lanes;
+
+	if (ov02c10->mclk_freq != OV02C10_MCLK_19_2MHZ)
+		vts_def = mult_frac(vts_def, ov02c10->mclk_freq,
+				    OV02C10_MCLK_19_2MHZ);
+
+	return vts_def;
+}
+
 static int ov02c10_init_controls(struct ov02c10 *ov02c10)
 {
 	struct v4l2_ctrl_handler *ctrl_hdlr = &ov02c10->ctrl_handler;
@@ -530,11 +672,49 @@ static int ov02c10_init_controls(struct ov02c10 *ov02c10)
 	pixel_rate = div_u64(link_freq_menu_items[ov02c10->link_freq_index] *
 			     2 * ov02c10->mipi_lanes, OV02C10_RGB_DEPTH);
 
+	/*
+	 * The sensor's register lists — PLL included — were written upstream for
+	 * a 19.2MHz external clock. This package also accepts the 26MHz clock
+	 * used on Raptor Lake boards, but nothing re-times the PLL, so on those
+	 * boards the whole sensor clock tree simply runs 26/19.2 = 1.354x fast.
+	 *
+	 * We deliberately do NOT try to re-time the PLL. Testing on real 26MHz
+	 * hardware (issue #71) showed 0x0304:0x0305 is the MIPI/link PLL — moving
+	 * it starves the CSI-2 link rather than changing frame timing — and that
+	 * 0x0316 is only a partial contributor (frame rate bottoms out at 26fps
+	 * with it zeroed, so it is not the core multiplier). The core PLL divider
+	 * is undocumented and nobody here has the datasheet, so re-timing it would
+	 * be a guess.
+	 *
+	 * Instead, take the fast clock as a given and correct for it in the two
+	 * places userspace actually cares about:
+	 *
+	 *   pixel_rate — tell libcamera the truth (~217MPix/s, not 160), so its
+	 *                line-time model is right and AGC computes real exposure
+	 *                times instead of ones 26% too short.
+	 *   vts_def    — pad the frame with vertical blanking so the frame rate
+	 *                comes back to the intended ~30fps. This also restores the
+	 *                full ~33ms exposure window, so AGC stops running out of
+	 *                integration time and reaching for analog gain in low light.
+	 *
+	 * Both scale by the measured clock, so a 19.2MHz board is bit-for-bit
+	 * unchanged. (Scaling — rather than hardcoding — is the point: an
+	 * unconditional vts/pixel_rate change would drop 19.2MHz boards to ~22fps.)
+	 */
+	vts_def = ov02c10_vts_def(ov02c10, mode);
+	if (ov02c10->mclk_freq != OV02C10_MCLK_19_2MHZ) {
+		pixel_rate = mult_frac(pixel_rate, ov02c10->mclk_freq,
+				       OV02C10_MCLK_19_2MHZ);
+
+		dev_info(ov02c10->dev,
+			 "%luHz clock (not %dHz): sensor runs fast; advertising pixel_rate=%lld and padding vts to %u for ~30fps\n",
+			 ov02c10->mclk_freq, OV02C10_MCLK_19_2MHZ,
+			 pixel_rate, vts_def);
+	}
+
 	ov02c10->pixel_rate = v4l2_ctrl_new_std(ctrl_hdlr, &ov02c10_ctrl_ops,
 						V4L2_CID_PIXEL_RATE, 0,
 						pixel_rate, 1, pixel_rate);
-
-	vts_def = mode->vts_min * ov02c10->mipi_lanes;
 
 	vblank_min = mode->vts_min - mode->height;
 	vblank_max = OV02C10_VTS_MAX - mode->height;
@@ -551,12 +731,12 @@ static int ov02c10_init_controls(struct ov02c10 *ov02c10)
 		ov02c10->hblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 
 	v4l2_ctrl_new_std(ctrl_hdlr, &ov02c10_ctrl_ops, V4L2_CID_ANALOGUE_GAIN,
-			  OV02C10_ANAL_GAIN_MIN, OV02C10_ANAL_GAIN_MAX,
+			  OV02C10_ANAL_GAIN_MIN, ov02c10_again_max(),
 			  OV02C10_ANAL_GAIN_STEP, OV02C10_ANAL_GAIN_DEFAULT);
 	v4l2_ctrl_new_std(ctrl_hdlr, &ov02c10_ctrl_ops, V4L2_CID_DIGITAL_GAIN,
 			  OV02C10_DGTL_GAIN_MIN, OV02C10_DGTL_GAIN_MAX,
-			  OV02C10_DGTL_GAIN_STEP, OV02C10_DGTL_GAIN_DEFAULT);
-	exposure_max = vts_def - OV02C10_EXPOSURE_MAX_MARGIN;
+			  OV02C10_DGTL_GAIN_STEP, ov02c10_dgain_default());
+	exposure_max = ov02c10_cap_exposure(vts_def - OV02C10_EXPOSURE_MAX_MARGIN);
 	ov02c10->exposure = v4l2_ctrl_new_std(ctrl_hdlr, &ov02c10_ctrl_ops,
 					      V4L2_CID_EXPOSURE,
 					      OV02C10_EXPOSURE_MIN,
@@ -628,6 +808,39 @@ static int ov02c10_enable_streams(struct v4l2_subdev *sd,
 		dev_err(ov02c10->dev, "failed to write lane settings\n");
 		goto out;
 	}
+
+	/*
+	 * Experimental PLL re-timing (issue #71). Applied last so it overrides
+	 * whatever the mode/lane lists just wrote. Off by default.
+	 */
+	if (pll_div >= 0) {
+		ret = cci_write(ov02c10->regmap, OV02C10_REG_PLL_DIV,
+				pll_div, NULL);
+		if (ret) {
+			dev_err(ov02c10->dev, "failed to write pll_div\n");
+			goto out;
+		}
+	}
+	if (pll_mult >= 0) {
+		ret = cci_write(ov02c10->regmap, OV02C10_REG_PLL_MULT,
+				pll_mult, NULL);
+		if (ret) {
+			dev_err(ov02c10->dev, "failed to write pll_mult\n");
+			goto out;
+		}
+	}
+	if (pll2_mult >= 0) {
+		ret = cci_write(ov02c10->regmap, OV02C10_REG_PLL2_MULT,
+				pll2_mult, NULL);
+		if (ret) {
+			dev_err(ov02c10->dev, "failed to write pll2_mult\n");
+			goto out;
+		}
+	}
+	if (pll_div >= 0 || pll_mult >= 0 || pll2_mult >= 0)
+		dev_info(ov02c10->dev,
+			 "PLL override active: div=%d mult=%d pll2_mult=%d (experimental, issue #71)\n",
+			 pll_div, pll_mult, pll2_mult);
 
 	ret = __v4l2_ctrl_handler_setup(ov02c10->sd.ctrl_handler);
 	if (ret)
@@ -731,8 +944,16 @@ static int ov02c10_set_format(struct v4l2_subdev *sd,
 	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY)
 		return 0;
 
-	/* Update limits and set FPS to default */
-	vblank_def = mode->vts_min * ov02c10->mipi_lanes - mode->height;
+	/*
+	 * Update limits and set FPS to default.
+	 *
+	 * This runs on every set_fmt — which libcamera calls during configure(),
+	 * i.e. immediately before streaming — and it *resets* VBLANK to the
+	 * default. So the clock correction has to be applied here too, not just
+	 * in init_controls(), or it gets silently overwritten right before the
+	 * camera starts and the sensor goes back to running fast. (issue #71)
+	 */
+	vblank_def = ov02c10_vts_def(ov02c10, mode) - mode->height;
 	__v4l2_ctrl_modify_range(ov02c10->vblank, mode->vts_min - mode->height,
 				 OV02C10_VTS_MAX - mode->height, 1, vblank_def);
 	__v4l2_ctrl_s_ctrl(ov02c10->vblank, vblank_def);
@@ -913,6 +1134,9 @@ static int ov02c10_probe(struct i2c_client *client)
 		return dev_err_probe(ov02c10->dev, -EINVAL,
 				     "external clock %lu is not supported",
 				     freq);
+
+	/* Needed by init_controls() to correct timing on non-19.2MHz clocks. */
+	ov02c10->mclk_freq = freq;
 
 	v4l2_i2c_subdev_init(&ov02c10->sd, client, &ov02c10_subdev_ops);
 

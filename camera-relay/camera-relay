@@ -24,6 +24,29 @@ SERVICE_DIR="${HOME}/.config/systemd/user"
 SERVICE_NAME="camera-relay.service"
 LOOPBACK_CONF="/etc/modprobe.d/99-camera-relay-loopback.conf"
 MONITOR_BIN="/usr/local/bin/camera-relay-monitor"
+LAUNCHER_BIN="/usr/local/bin/camera-relay-gst"
+
+# Arguments shared by every launcher invocation. The launcher is setgid, so it
+# replaces its environment wholesale rather than trusting what it inherited —
+# the paths setup_environment exported have to be handed over as arguments.
+LAUNCHER_ARGS=()
+build_launcher_args() {
+    LAUNCHER_ARGS=()
+    [[ -n "${GST_PLUGIN_PATH:-}" ]] && \
+        LAUNCHER_ARGS+=(--gst-plugin-path "$GST_PLUGIN_PATH")
+    [[ -n "${LIBCAMERA_IPA_MODULE_PATH:-}" ]] && \
+        LAUNCHER_ARGS+=(--ipa-path "$LIBCAMERA_IPA_MODULE_PATH")
+    [[ -n "${LIBCAMERA_SOFTISP_MODE:-}" ]] && \
+        LAUNCHER_ARGS+=(--softisp-mode "$LIBCAMERA_SOFTISP_MODE")
+    # Must be forwarded explicitly: without the pin the debayer lands on
+    # whichever EGL ICD GLVND loads first, which on a hybrid laptop is
+    # NVIDIA's — and every frame comes out black (PR #76).
+    [[ -n "${__EGL_VENDOR_LIBRARY_FILENAMES:-}" ]] && \
+        LAUNCHER_ARGS+=(--egl-vendor "$__EGL_VENDOR_LIBRARY_FILENAMES")
+    [[ -n "${RELAY_COLOR_FILTER:-}" ]] && \
+        LAUNCHER_ARGS+=(--color-filter "$RELAY_COLOR_FILTER")
+    return 0
+}
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -63,23 +86,29 @@ detect_camera_name() {
     # Output format: "1: 'ov02c10' (\_SB_.PC00.LNK0)"
     # Extract the camera ID from parentheses — this is what gst-launch needs
     # for the camera-name property (not the display name in quotes).
-    local cam_cmd=""
-    # Prefer /usr/local/bin/cam only if it actually runs (not broken by stale libs)
-    if [[ -x /usr/local/bin/cam ]] && /usr/local/bin/cam -l &>/dev/null; then
-        cam_cmd="/usr/local/bin/cam"
+    # The raw camera nodes belong to the memberless camera-relay group, so a
+    # plain `cam` run as the user can no longer enumerate them. Go through the
+    # launcher, which holds the group. Direct `cam` remains the fallback for
+    # installs without the launcher and for hardware whose nodes were never
+    # restricted (nothing MC-centric to hide).
+    local -a cam_cmd=()
+    if [[ -x "$LAUNCHER_BIN" ]] && "$LAUNCHER_BIN" --list-cameras &>/dev/null; then
+        cam_cmd=("$LAUNCHER_BIN" --list-cameras)
+    elif [[ -x /usr/local/bin/cam ]] && /usr/local/bin/cam -l &>/dev/null; then
+        cam_cmd=(/usr/local/bin/cam -l)
     elif command -v cam &>/dev/null; then
-        cam_cmd="cam"
+        cam_cmd=(cam -l)
     fi
-    if [[ -n "$cam_cmd" ]]; then
+    if (( ${#cam_cmd[@]} > 0 )); then
         local name
-        name=$("$cam_cmd" -l 2>/dev/null | grep -oP '\(([^)]+)\)' | head -1 | tr -d '()')
+        name=$("${cam_cmd[@]}" 2>/dev/null | grep -oP '\(([^)]+)\)' | head -1 | tr -d '()')
         if [[ -n "$name" ]]; then
             echo "$name" > "$CAMERA_CACHE"
             echo "$name"
             return 0
         fi
         # Fallback to quoted display name if no parenthesized ID
-        name=$("$cam_cmd" -l 2>/dev/null | grep -oP "'[^']+'" | head -1 | tr -d "'")
+        name=$("${cam_cmd[@]}" 2>/dev/null | grep -oP "'[^']+'" | head -1 | tr -d "'")
         if [[ -n "$name" ]]; then
             echo "$name" > "$CAMERA_CACHE"
             echo "$name"
@@ -215,6 +244,31 @@ is_persistent() {
     systemctl --user is-enabled "$SERVICE_NAME" &>/dev/null 2>&1
 }
 
+# Both relay modes keep the loopback open for as long as they run: the always-on
+# pipeline through v4l2sink, the on-demand monitor through the writer fd it
+# never releases. So a v4l2loopback reference count of zero means nothing is
+# attached to the device, whatever our PID file says.
+relay_holds_loopback() {
+    local refcount
+    refcount=$(awk '$1 == "v4l2loopback" { print $3 }' /proc/modules 2>/dev/null)
+    [[ -n "$refcount" && "$refcount" != "0" ]]
+}
+
+# "The PID is alive" is not the same as "the relay is working". In issue #65 a
+# gst-launch-1.0 stayed alive after letting go of the loopback, so is_running()
+# said yes, status printed STREAMING, and — worst of all — the on-demand service
+# no-opped with "Already running" and exited 0, which Restart=on-failure treats
+# as success. systemd therefore never retried and the camera stayed dead until a
+# reboot wiped XDG_RUNTIME_DIR. Detect that and clear it instead of trusting it.
+already_running_healthy() {
+    is_running || return 1
+    relay_holds_loopback && return 0
+    warn "PID $(cat "$PID_FILE" 2>/dev/null) is alive but no process holds the v4l2loopback device"
+    warn "Clearing stale relay state and starting fresh"
+    cmd_stop >/dev/null 2>&1 || true
+    return 1
+}
+
 detect_gst_plugin_path() {
     local dir
     for dir in /usr/local/lib/x86_64-linux-gnu/gstreamer-1.0 \
@@ -288,7 +342,134 @@ detect_ipa_path() {
     return 1
 }
 
+# The relay pipeline IS gst-launch-1.0, and gst-inspect-1.0 is how we probe for
+# libcamerasrc. Both ship in a package of their own (gstreamer1.0-tools on
+# Debian/Ubuntu) that nothing else here pulls in — gstreamer1.0-libcamera does
+# not depend on it. Check for them explicitly: without this, a missing
+# gst-inspect-1.0 exits 127 and every probe below reads as "libcamerasrc not
+# found", sending users to reinstall a libcamera plugin they already have
+# (issue #65).
+require_gst_tools() {
+    local missing=()
+    command -v gst-inspect-1.0 &>/dev/null || missing+=("gst-inspect-1.0")
+    command -v gst-launch-1.0 &>/dev/null || missing+=("gst-launch-1.0")
+    (( ${#missing[@]} == 0 )) && return 0
+    die "GStreamer command-line tools not found (missing: ${missing[*]}).
+The relay pipeline is built on gst-launch-1.0, so it cannot run without them:
+  Fedora:        sudo dnf install gstreamer1
+  Arch:          sudo pacman -S gstreamer
+  Ubuntu/Debian: sudo apt install gstreamer1.0-tools"
+}
+
+# Path of an installed libcamera GStreamer plugin, if any. Used to tell
+# "the package is missing" apart from "the package is there but GStreamer
+# refuses to load it" — two problems with completely different fixes.
+find_libcamera_gst_plugin() {
+    local so
+    for so in /usr/lib/*/gstreamer-1.0/libgstlibcamera.so \
+              /usr/lib64/gstreamer-1.0/libgstlibcamera.so \
+              /usr/lib/gstreamer-1.0/libgstlibcamera.so \
+              /usr/local/lib/*/gstreamer-1.0/libgstlibcamera.so \
+              /usr/local/lib64/gstreamer-1.0/libgstlibcamera.so \
+              /usr/local/lib/gstreamer-1.0/libgstlibcamera.so; do
+        if [[ -f "$so" ]]; then
+            echo "$so"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# ── Hybrid-GPU EGL vendor selection ──────────────────────────────────────────
+#
+# libcamera's Software ISP converts Bayer→RGB on the GPU through EGL
+# (debayer_egl.cpp). *Which* GPU that is comes from GLVND, which loads the
+# vendor ICDs in /usr/share/glvnd/egl_vendor.d in filename order — and NVIDIA's
+# ships as 10_nvidia.json, ahead of Mesa's 50_mesa.json. So on a hybrid laptop
+# (Intel or AMD iGPU + NVIDIA dGPU — the Galaxy Book4 Ultra and the dGPU Book5
+# Pro variants ship this way) the debayer runs on NVIDIA's proprietary EGL
+# driver, which it is not compatible with:
+#
+#   ERROR eGL egl.cpp:134 glFrameBufferTexture2D error 36054
+#   ERROR Debayer debayer_egl.cpp:639 debayerGPU failed
+#
+# The sensor still powers up — the privacy LED comes on, `status` says
+# STREAMING — but not one frame ever reaches v4l2loopback, so apps show a black
+# picture ("your camera may be blocked" in Google Meet).
+#
+# This hides well interactively: a desktop session usually has EGL already
+# resolved to Mesa, so `cam` from a terminal works and only the systemd service
+# breaks. Pinning __EGL_VENDOR_LIBRARY_FILENAMES makes the choice explicit in
+# both places. The alternative fix, LIBCAMERA_SOFTISP_MODE=cpu, also works but
+# costs a large chunk of the framerate (issue #66) — pin the iGPU instead.
+
+# Render nodes and the kernel driver behind each, as "renderD128 i915" lines.
+render_node_drivers() {
+    local node base link drv
+    for node in /dev/dri/renderD*; do
+        [[ -e "$node" ]] || continue
+        base=$(basename "$node")
+        drv="unknown"
+        if link=$(readlink -f "/sys/class/drm/$base/device/driver" 2>/dev/null) \
+           && [[ -n "$link" ]]; then
+            drv=$(basename "$link")
+        fi
+        echo "$base $drv"
+    done
+    return 0
+}
+
+# The GLVND vendor ICD that dispatches to Mesa, wherever the distro put it.
+# Deliberately not hardcoded to 50_mesa.json: the filename prefix is only a
+# load-order hint and distros renumber it.
+find_mesa_egl_vendor() {
+    local dir f
+    # GLVND reads /etc/glvnd/egl_vendor.d first, then /usr/share; within a
+    # directory, filename order. Match that so we name the file GLVND would use.
+    for dir in /etc/glvnd/egl_vendor.d /usr/share/glvnd/egl_vendor.d; do
+        [[ -d "$dir" ]] || continue
+        for f in "$dir"/*.json; do
+            [[ -f "$f" ]] || continue
+            if grep -q 'libEGL_mesa' "$f" 2>/dev/null; then
+                echo "$f"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+# Echo the EGL vendor ICD to pin for the debayer, or return 1 to leave GLVND
+# alone. Only a genuinely mixed NVIDIA-proprietary + Mesa setup gets a pin:
+# on a single-GPU box it is redundant, and on an NVIDIA-only box pointing at a
+# Mesa ICD that cannot drive the hardware would break a working camera.
+detect_egl_vendor_pin() {
+    local base drv have_nvidia=false mesa_driver="" count=0
+
+    while read -r base drv; do
+        [[ -n "$base" ]] || continue
+        count=$((count + 1))
+        case "$drv" in
+            nvidia|nvidia-drm)  have_nvidia=true ;;
+            unknown|"")         ;;
+            *)                  [[ -n "$mesa_driver" ]] || mesa_driver="$drv" ;;
+        esac
+    done < <(render_node_drivers)
+
+    $have_nvidia || return 1
+    [[ -n "$mesa_driver" ]] || return 1
+    (( count >= 2 )) || return 1
+
+    # Derive the target from the iGPU that is actually present rather than
+    # assuming Mesa: every non-NVIDIA render node we can meet here (i915, xe,
+    # amdgpu, radeon, nouveau) is driven by Mesa's EGL, so the file to pin is
+    # whichever ICD dispatches to libEGL_mesa.
+    find_mesa_egl_vendor
+}
+
 setup_environment() {
+    require_gst_tools
+
     # Save current env so we can roll back if the /usr/local override breaks things
     local saved_ld_library_path="${LD_LIBRARY_PATH:-}"
     local saved_gst_plugin_path="${GST_PLUGIN_PATH:-}"
@@ -343,10 +524,32 @@ setup_environment() {
                 rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/gstreamer-1.0" 2>/dev/null || true
             fi
             if ! gst-inspect-1.0 libcamerasrc &>/dev/null; then
+                # Show what GStreamer actually complained about, and don't tell
+                # people to install a package that is demonstrably already on
+                # disk — that dead end is the whole of issue #65.
+                local inspect_err plugin_so
+                # gst-inspect-1.0 exits non-zero here by definition; without the
+                # `|| true` pipefail would abort the script before it can report.
+                inspect_err=$(gst-inspect-1.0 libcamerasrc 2>&1 >/dev/null | tail -5) || true
+                if plugin_so=$(find_libcamera_gst_plugin); then
+                    die "GStreamer 'libcamerasrc' element not found, but the plugin IS installed:
+  $plugin_so
+So the package is fine and something is stopping GStreamer from loading it.
+Try, in order:
+  rm -rf ~/.cache/gstreamer-1.0     # stale or blacklisted registry entry
+  ldd $plugin_so | grep 'not found'
+  gst-inspect-1.0 --gst-debug=GST_PLUGIN_LOADING:5 libcamerasrc 2>&1 | tail -30
+${inspect_err:+
+gst-inspect-1.0 said:
+$inspect_err}"
+                fi
                 die "GStreamer 'libcamerasrc' element not found. Install it:
   Fedora:        sudo dnf install gstreamer1-plugin-libcamera
   Arch:          sudo pacman -S gst-plugin-libcamera
-  Ubuntu/Debian: sudo apt install gstreamer1.0-libcamera"
+  Ubuntu/Debian: sudo apt install gstreamer1.0-libcamera
+${inspect_err:+
+gst-inspect-1.0 said:
+$inspect_err}"
             fi
             info "Using system libcamerasrc"
         else
@@ -358,6 +561,16 @@ setup_environment() {
     local ipa_path
     if ipa_path=$(detect_ipa_path); then
         export LIBCAMERA_IPA_MODULE_PATH="$ipa_path"
+    fi
+
+    # Keep the GPU debayer off the NVIDIA EGL driver on hybrid laptops. An
+    # explicit setting from the caller always wins — if someone pinned a vendor
+    # by hand, that is the answer they want tested.
+    local egl_vendor
+    if [[ -z "${__EGL_VENDOR_LIBRARY_FILENAMES:-}" ]] \
+       && egl_vendor=$(detect_egl_vendor_pin); then
+        export __EGL_VENDOR_LIBRARY_FILENAMES="$egl_vendor"
+        info "Hybrid GPU detected — pinning EGL to $egl_vendor for the debayer"
     fi
 }
 
@@ -374,30 +587,20 @@ start_pipeline() {
     local fast="${3:-false}"
     local gst_log="${XDG_RUNTIME_DIR:-/tmp}/camera-relay-gst.log"
 
-    # gst-launch-1.0 interprets backslashes as escape characters.
-    # Camera names like "\_SB_.LNK0" need double-escaping.
-    local gst_camera_name="${camera_name//\\/\\\\}"
-
-    # Use io-mode=mmap for v4l2sink — kernel-managed buffers are the most
-    # compatible across v4l2loopback versions. io-mode=rw (1) breaks on
-    # some Fedora systems; io-mode=auto (0) may fall through to rw.
-    # GStreamer enum: 0=auto, 1=rw, 2=mmap, 3=userptr, 4=dmabuf
-    # RELAY_COLOR_FILTER: optional GStreamer element(s) for color correction.
-    # Set in service environment to apply per-sensor tuning, e.g.:
+    # The launcher assembles the pipeline itself — it is setgid and must never
+    # run a command line handed to it. Backslash escaping for the gst-launch
+    # parser (camera names look like "\_SB_.LNK0") happens in there too.
+    # RELAY_COLOR_FILTER: optional GStreamer element(s) for color correction,
+    # set in the service environment for per-sensor tuning, e.g.
     #   RELAY_COLOR_FILTER="videobalance saturation=0.85"
-    local -a color_filter=()
-    if [[ -n "${RELAY_COLOR_FILTER:-}" ]]; then
-        color_filter=(! $RELAY_COLOR_FILTER)
-    fi
+    # The launcher accepts only allow-listed video filters.
+    build_launcher_args
 
     local -a gst_cmd=(
-        gst-launch-1.0 -e
-        libcamerasrc camera-name="$gst_camera_name"
-        ! queue max-size-buffers=3 leaky=downstream
-        ! videoconvert
-        "${color_filter[@]}"
-        ! "video/x-raw,format=YUY2"
-        ! v4l2sink device="$loopback_dev" io-mode=mmap sync=false
+        "$LAUNCHER_BIN"
+        --camera "$camera_name"
+        --v4l2-sink "$loopback_dev"
+        "${LAUNCHER_ARGS[@]}"
     )
 
     "${gst_cmd[@]}" >"$gst_log" 2>&1 &
@@ -431,13 +634,183 @@ stop_pipeline() {
     fi
 }
 
-# No longer needed: with exclusive_caps=0, v4l2loopback always has
-# VIDEO_CAPTURE, so WirePlumber discovers it correctly on its own.
-# The old nudge_wireplumber (udevadm trigger + WirePlumber restart) was
-# needed for exclusive_caps=1 where caps only flipped after the relay
-# opened the device for writing. Removed because:
-# 1. sudo prompt blocks/confuses users
-# 2. WirePlumber restart disrupts active camera streams (causes flip)
+# What media.webrtc.camera.allow-pipewire is set to in one Firefox profile.
+#
+# prefs.js only records prefs that differ from the build's default, so an absent
+# entry is not the same as "false" — distributions have shipped patched defaults
+# both ways. Report that as unknown rather than inventing a value.
+#
+# Parsed with sed rather than sourced: prefs.js is JavaScript, and Firefox
+# rewrites the file wholesale on exit, so the last assignment is the live one.
+firefox_pipewire_pref_state() {
+    local prefs="$1" val
+    [[ -r "$prefs" ]] || return 1
+    val=$(sed -n 's/^[[:space:]]*user_pref("media\.webrtc\.camera\.allow-pipewire",[[:space:]]*\(true\|false\)).*/\1/p' \
+          "$prefs" | tail -1)
+    case "$val" in
+        true)  echo "ENABLED" ;;
+        false) echo "DISABLED" ;;
+        *)     echo "not set (build default)" ;;
+    esac
+}
+
+# nudge_wireplumber — make WirePlumber re-read the loopback's formats.
+#
+# This was removed once, on the grounds that exclusive_caps=0 always advertises
+# VIDEO_CAPTURE so WirePlumber classifies the node correctly on its own. That
+# part is true. What it missed is that *capabilities* are not the only thing
+# WirePlumber reads once and caches — the format list is too.
+#
+# v4l2loopback is loaded at boot from modules-load.d with no producer, so it
+# advertises its generic catch-all format set: BGRx/xRGB/BGR at any size from
+# 2x1 to 8192x8192, expressed as a Choice:Range. The relay's monitor only pins
+# YUYV 1920x1080 when it starts, at login — and camera-relay.service is
+# ordered After=wireplumber.service, so WirePlumber has already probed the
+# unconfigured device and will never look again.
+#
+# Firefox never noticed: it reads /dev/video0 directly. WebRTC's PipeWire camera
+# path (Chrome, Brave, Electron) parses SPA_PARAM_EnumFormat and needs a
+# discrete rectangle — a Choice:Range yields no parseable resolution, so the
+# node arrives with zero capabilities. Chrome logs "Found Camera: Camera Relay
+# (V4L2)" and then offers no device at all, which reads exactly like the camera
+# being missing.
+#
+# There is no lighter re-probe: the V4L2 monitor is udev-driven, nodes are built
+# at discovery, and WirePlumber exposes no "re-probe this device" call. Restart
+# is the documented answer — see "device.capabilities is read-only in PipeWire"
+# in webcam-fix/README.md, and the ExecStartPost the legacy v4l2-relayd fix uses.
+#
+# The two objections that got this removed do not apply to where it now runs:
+#   1. "sudo prompt blocks/confuses users" — that was udevadm trigger, needed
+#      because v4l2-relayd is a system service. camera-relay is a *user*
+#      service, so systemctl --user needs no privileges, and the restart alone
+#      is sufficient — the udev event was only ever about the caps flip.
+#   2. "restart disrupts active camera streams" — this runs from ExecStartPost
+#      at relay start, when by definition nothing is streaming yet.
+#
+# Conditional, so restarting the relay by hand does not cost an audio glitch
+# when the formats are already right.
+
+# The format the loopback really offers, as "<fourcc> <width>x<height>".
+#
+# Buffered into a variable first, then parsed from a here-string. Piping
+# v4l2-ctl into an awk that exits at the first match SIGPIPEs the writer, and
+# under `set -o pipefail` that surfaces as rc=141 — which reads as "no format"
+# and silently disables the whole check.
+loopback_real_format() {
+    local dev="$1" out
+    command -v v4l2-ctl &>/dev/null || return 1
+    out=$(v4l2-ctl -d "$dev" --list-formats-ext 2>/dev/null) || return 1
+    awk '
+        /^\t\[[0-9]+\]:/ { if (fmt == "") { fmt = $2; gsub(/'"'"'/, "", fmt) } }
+        /Size: Discrete/ { if (!done) { print fmt, $3; done = 1 } }
+    ' <<< "$out"
+}
+
+# Global id of the PipeWire node backing this loopback, if any.
+pipewire_node_for() {
+    local dev="$1"
+    command -v pw-dump &>/dev/null || return 1
+    command -v python3 &>/dev/null || return 1
+    pw-dump 2>/dev/null | python3 -c '
+import json, sys
+want = sys.argv[1]
+try:
+    data = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+for obj in data:
+    props = (obj.get("info") or {}).get("props") or {}
+    if props.get("media.class") == "Video/Source" and props.get("api.v4l2.path") == want:
+        print(obj["id"])
+        break
+' "$dev" 2>/dev/null
+}
+
+nudge_wireplumber() {
+    local dev="$1"
+    command -v systemctl &>/dev/null || return 0
+    command -v pw-cli &>/dev/null || return 0
+
+    local real node advertised
+    real=$(loopback_real_format "$dev") || return 0
+    [[ -n "$real" ]] || return 0
+
+    node=$(pipewire_node_for "$dev") || return 0
+    if [[ -z "$node" ]]; then
+        # No node yet — WirePlumber has not seen the device at all. A restart
+        # would not conjure one; leave it alone.
+        return 0
+    fi
+
+    # Same buffering rule as loopback_real_format: no `head` on a live pipe.
+    local params
+    params=$(pw-cli enum-params "$node" EnumFormat 2>/dev/null) || params=""
+    advertised=$(awk '/Rectangle/ { print $2; exit }' <<< "$params")
+
+    # Reading nothing is not evidence of a mismatch. Treating it as one would
+    # restart WirePlumber on every single relay start on any machine whose
+    # pw-cli output we cannot parse — an audio glitch per boot, forever, for a
+    # problem we have not established exists.
+    local want="${real##* }"
+    if [[ -z "$advertised" ]]; then
+        info "Could not read PipeWire's format for $dev — leaving WirePlumber alone"
+        return 0
+    fi
+
+    # A discrete rectangle matching the device means WirePlumber probed after
+    # the monitor pinned the format. Anything else — a range, or a stale
+    # resolution — means it probed too early.
+    if [[ "$advertised" == "$want" ]]; then
+        info "WirePlumber already sees $want — no re-probe needed"
+        return 0
+    fi
+
+    info "WirePlumber has stale formats for $dev (sees ${advertised:-none}, device offers $want)"
+    info "Restarting WirePlumber so PipeWire-based apps (Chrome, Brave) see a usable camera"
+    # --no-block: this unit is ordered After=wireplumber.service, so waiting on
+    # a wireplumber job from inside our own ExecStartPost can deadlock.
+    systemctl --user restart --no-block wireplumber 2>/dev/null || true
+}
+
+cmd_nudge_wireplumber() {
+    local dev
+    dev=$(detect_loopback_device 2>/dev/null) || return 0
+
+    # The unit is Type=simple, so systemd runs ExecStartPost as soon as
+    # ExecStart *forks* — well before the monitor has pinned YUYV on the
+    # loopback. Comparing at that moment reads no discrete format at all, which
+    # this function cannot distinguish from "nothing to do", so it would return
+    # silently and the stale node would survive the whole session. Wait for the
+    # monitor, bounded, then compare. (The legacy v4l2-relayd fix papered over
+    # the same race with a flat `sleep 2`.)
+    # systemd takes the unit through start-post even when ExecStart has already
+    # failed, so this can be running alongside a relay that is not there. Left
+    # unchecked the wait below burns its full 15s on every restart attempt of a
+    # relay that cannot start — turning a RestartSec=5 recovery loop into 20s a
+    # cycle and filling the journal with a format complaint that is not the
+    # problem. Observed for real against a machine missing camera-relay-gst.
+    #
+    # The grace period covers the opposite race: ExecStartPost can beat
+    # ExecStart to writing the PID file, and treating that as "relay is gone"
+    # would disable the check on every healthy boot.
+    local waited=0
+    while [[ -z "$(loopback_real_format "$dev")" ]] && (( waited < 15 )); do
+        if (( waited >= 5 )) && ! is_running; then
+            info "Relay is not running — skipping WirePlumber check"
+            return 0
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    if [[ -z "$(loopback_real_format "$dev")" ]]; then
+        info "Loopback reported no format after ${waited}s — skipping WirePlumber check"
+        return 0
+    fi
+
+    nudge_wireplumber "$dev"
+}
 
 # ── Commands ─────────────────────────────────────────────────────────────────
 
@@ -452,7 +825,7 @@ cmd_start() {
     local foreground=false
     [[ "$mode" == "--foreground" ]] && foreground=true
 
-    if is_running; then
+    if already_running_healthy; then
         local pid
         pid=$(cat "$PID_FILE")
         info "Already running (PID $pid)"
@@ -472,19 +845,23 @@ cmd_start() {
     info "Camera:   $camera_name"
     info "Loopback: $loopback_dev"
 
-    local gst_log="${XDG_RUNTIME_DIR:-/tmp}/camera-relay.log"
+    # Must match the log start_pipeline actually writes to. It used to say
+    # camera-relay.log — the on-demand daemon's log — so a failed always-on
+    # pipeline printed "GStreamer output:" followed by nothing at all, or by
+    # lines from an unrelated run (issue #65).
+    local gst_log="${XDG_RUNTIME_DIR:-/tmp}/camera-relay-gst.log"
 
     if $foreground; then
         info "Starting relay (foreground)..."
         echo "streaming" > "$STATE_CACHE"
         echo $$ > "$PID_FILE"
-        local gst_camera_name="${camera_name//\\/\\\\}"
-        exec gst-launch-1.0 -e \
-            libcamerasrc camera-name="$gst_camera_name" \
-            ! queue max-size-buffers=3 leaky=downstream \
-            ! videoconvert \
-            ! "video/x-raw,format=YUY2" \
-            ! v4l2sink device="$loopback_dev" io-mode=mmap sync=false
+        # Same launcher as the backgrounded path, so this one now honours
+        # RELAY_COLOR_FILTER too — it used to silently drop it.
+        build_launcher_args
+        exec "$LAUNCHER_BIN" \
+            --camera "$camera_name" \
+            --v4l2-sink "$loopback_dev" \
+            "${LAUNCHER_ARGS[@]}"
     else
         info "Starting relay..."
         local pid
@@ -494,7 +871,10 @@ cmd_start() {
             echo "" >&2
             echo "ERROR: Relay failed to start. GStreamer output:" >&2
             echo "───────────────────────────────────────────────" >&2
-            tail -20 "$gst_log" 2>/dev/null >&2 || true
+            # Order matters: `2>/dev/null >&2` points fd 2 at /dev/null and then
+            # duplicates *that* onto fd 1, so tail's output was discarded — the
+            # second half of why this block printed an empty banner (issue #65).
+            tail -20 "$gst_log" >&2 2>/dev/null || true
             echo "───────────────────────────────────────────────" >&2
             echo "" >&2
             echo "Common causes:" >&2
@@ -515,7 +895,7 @@ cmd_start() {
 }
 
 cmd_start_on_demand() {
-    if is_running; then
+    if already_running_healthy; then
         local pid
         pid=$(cat "$PID_FILE")
         info "Already running (PID $pid)"
@@ -541,6 +921,13 @@ cmd_start_on_demand() {
 Run the installer to build it, or use 'camera-relay start' for always-on mode."
     fi
 
+    # Without the launcher the pipeline cannot open the raw camera nodes —
+    # they belong to the camera-relay group, which this session is not in.
+    if [[ ! -x "$LAUNCHER_BIN" ]]; then
+        die "camera-relay-gst not found at $LAUNCHER_BIN.
+Run the installer to build it — the pipeline needs it to reach the camera."
+    fi
+
     echo $$ > "$PID_FILE"
     echo "idle" > "$STATE_CACHE"
 
@@ -554,33 +941,42 @@ Run the installer to build it, or use 'camera-relay start' for always-on mode."
     # YUY2 frames from its stdout, and relays them to the device.
     # This avoids the writer fd handoff gap — the monitor always holds
     # the device open, so ready_for_capture never drops.
-    local gst_camera_name="${camera_name//\\/\\\\}"
-    local -a color_filter=()
-    if [[ -n "${RELAY_COLOR_FILTER:-}" ]]; then
-        color_filter=(! $RELAY_COLOR_FILTER)
-    fi
+    build_launcher_args
 
     local -a gst_cmd=(
-        gst-launch-1.0 -e
-        libcamerasrc camera-name="$gst_camera_name"
-        ! queue max-size-buffers=3 leaky=downstream
-        ! videoconvert
-        "${color_filter[@]}"
-        ! "video/x-raw,format=YUY2,width=1920,height=1080"
-        ! fdsink fd=3 sync=false
+        "$LAUNCHER_BIN"
+        --camera "$camera_name"
+        --fd-sink 3
+        --width 1920 --height 1080
+        "${LAUNCHER_ARGS[@]}"
     )
 
     # Clean up all children on exit
     cleanup_on_demand() {
-        pkill -P $$ 2>/dev/null
+        # `|| true` is load-bearing: with no children left, pkill exits 1, and a
+        # command failing inside an EXIT trap under set -e replaces the shell's
+        # exit status with its own. That silently turned every status into 1 —
+        # including the monitor's, which is the whole point of the sentinel
+        # above.
+        pkill -P $$ 2>/dev/null || true
         rm -f "$PID_FILE" "$STATE_CACHE"
     }
     trap cleanup_on_demand EXIT
 
     # The monitor manages the pipeline subprocess itself.
     # We just read its events for status tracking.
+    #
+    # A process substitution gives no way to observe the child's exit code —
+    # it lands in neither $? nor PIPESTATUS. Without the sentinel below this
+    # function always returned 0, so a monitor that gave up looked like a
+    # clean shutdown and Restart=on-failure never fired: the same shape as the
+    # "Already running" exit-0 bug described above already_running_healthy().
+    local monitor_rc=0
     while IFS= read -r event; do
         case "$event" in
+            __monitor_exit:*)
+                monitor_rc="${event#__monitor_exit:}"
+                ;;
             READY)
                 info "Monitor ready, device visible to apps"
                 ;;
@@ -594,10 +990,17 @@ Run the installer to build it, or use 'camera-relay start' for always-on mode."
                 info "Camera released, resuming idle"
                 ;;
         esac
-    done < <("$MONITOR_BIN" "$loopback_dev" 1920 1080 \
-             -- "${gst_cmd[@]}" 2>"$gst_log")
+    # `|| rc=$?` rather than a bare `; echo ...$?`: the subshell inherits set -e,
+    # so a failing monitor would abort it before the sentinel was ever emitted —
+    # which looks exactly like the bug this is here to prevent.
+    done < <(rc=0; "$MONITOR_BIN" "$loopback_dev" 1920 1080 \
+             -- "${gst_cmd[@]}" 2>"$gst_log" || rc=$?; echo "__monitor_exit:$rc")
 
+    if (( monitor_rc != 0 )); then
+        warn "Monitor exited with status $monitor_rc — see $gst_log"
+    fi
     info "On-demand relay stopped"
+    return "$monitor_rc"
 }
 
 cmd_stop() {
@@ -644,6 +1047,10 @@ cmd_status() {
     [[ -z "$camera" ]] && camera=$(detect_camera_name 2>/dev/null) || true
     [[ -z "$camera" ]] && camera="(not detected)"
     device=$(cat "$DEVICE_CACHE" 2>/dev/null) || device=""
+    # Fall back to a live probe like the camera line above does. Reading only
+    # the cache reported "(not loaded)" whenever the relay had never started,
+    # even with v4l2loopback loaded and a device present (issue #65).
+    [[ -z "$device" ]] && device=$(detect_loopback_device 2>/dev/null) || true
     [[ -z "$device" ]] && device="(not loaded)"
     state=$(cat "$STATE_CACHE" 2>/dev/null) || state="stopped"
     $running || state="stopped"
@@ -673,16 +1080,619 @@ cmd_status() {
     fi
 }
 
+# One-shot report covering every layer between the sensor and the browser.
+# Issue #65 took six round trips because "the relay starts but the browser sees
+# nothing" had no single command that could tell those layers apart: a working
+# `gst-launch ... autovideosink` proves the camera, and `lsmod` proves the
+# module, but neither says whether frames are reaching the loopback — which is
+# the one fact that decides whether the bug is ours or the browser's.
+# Changes no state, never exits non-zero, and is meant to be pasted whole.
+cmd_doctor() {
+    local rt="${XDG_RUNTIME_DIR:-/tmp}"
+
+    echo "camera-relay doctor — paste this whole block into a bug report"
+    echo "=============================================================="
+
+    echo
+    echo "── System ──"
+    echo "  Distro:  $(grep -oP '^PRETTY_NAME="\K[^"]+' /etc/os-release 2>/dev/null || echo unknown)"
+    echo "  Kernel:  $(uname -r)"
+    echo "  Session: ${XDG_SESSION_TYPE:-unknown}"
+    # No pipeline here on purpose: `... | grep -q` makes grep exit on the first
+    # match, SIGPIPEs the writer, and `set -o pipefail` then reports the whole
+    # test as false. The same trap is why the module check below reads
+    # /proc/modules directly instead of piping lsmod.
+    if [[ " $(id -nG 2>/dev/null) " == *" video "* ]]; then
+        echo "  Groups:  video group OK"
+    else
+        echo "  Groups:  NOT in the 'video' group — sudo usermod -aG video $USER, then log out and back in"
+    fi
+
+    # The raw camera nodes are reachable only through the setgid launcher. If
+    # it loses that bit (a plain `cp` drops it) the camera stops working, with
+    # nothing in the GStreamer log pointing at the cause.
+    if [[ -x "$LAUNCHER_BIN" ]]; then
+        local l_mode l_group
+        l_mode=$(stat -c%a "$LAUNCHER_BIN" 2>/dev/null || echo "")
+        l_group=$(stat -c%G "$LAUNCHER_BIN" 2>/dev/null || echo "?")
+        if [[ "$l_mode" == 2??? ]]; then
+            echo "  Launcher: setgid $l_group OK"
+        else
+            echo "  Launcher: $LAUNCHER_BIN is not setgid (mode ${l_mode:-?}) —"
+            echo "            it cannot reach the raw camera nodes. Re-run the installer."
+        fi
+    else
+        echo "  Launcher: $LAUNCHER_BIN missing — re-run the installer"
+    fi
+
+    # Self-check the whole point of the arrangement: any MC-centric node this
+    # session can still open is one that shows up as a bogus camera in app
+    # pickers. The helper can only report on nodes it manages to open, so a
+    # successful IO_MC=1 read here IS the leak.
+    local mc_helper=/usr/local/lib/udev/camera-relay-v4l2-io-mc
+    if [[ -x "$mc_helper" ]]; then
+        local leaked=0 v
+        for v in /dev/video*; do
+            [[ -e "$v" ]] || continue
+            if [[ "$("$mc_helper" "$v" 2>/dev/null)" == "ID_V4L_IO_MC=1" ]]; then
+                leaked=$((leaked + 1))
+            fi
+        done
+        if (( leaked > 0 )); then
+            echo "  MC nodes: $leaked raw node(s) still open to this session —"
+            echo "            they will appear as spurious cameras in apps."
+            echo "            Re-run the installer, then log out and back in."
+        else
+            echo "  MC nodes: hidden from this session OK"
+        fi
+    fi
+
+    echo
+    echo "── Tools ──"
+    local t missing_tools=()
+    for t in gst-inspect-1.0 gst-launch-1.0 v4l2-ctl; do
+        if command -v "$t" &>/dev/null; then
+            echo "  $t: $(command -v "$t")"
+        else
+            echo "  $t: MISSING"
+            missing_tools+=("$t")
+        fi
+    done
+    if (( ${#missing_tools[@]} > 0 )); then
+        echo "  install: gstreamer1.0-tools + v4l-utils (Debian/Ubuntu),"
+        echo "           gstreamer1 + v4l-utils (Fedora), gstreamer + v4l-utils (Arch)"
+    fi
+
+    echo
+    echo "── libcamera ──"
+    echo "  version: $(pkg-config --modversion libcamera 2>/dev/null || echo '(libcamera-dev/pkg-config not installed)')"
+    local cam_name plugin_so
+    if cam_name=$(detect_camera_name 2>/dev/null); then
+        echo "  camera:  $cam_name"
+    else
+        echo "  camera:  NOT DETECTED"
+    fi
+    if plugin_so=$(find_libcamera_gst_plugin); then
+        echo "  gst plugin: $plugin_so"
+    else
+        echo "  gst plugin: no libgstlibcamera.so found on disk"
+    fi
+    if command -v gst-inspect-1.0 &>/dev/null; then
+        if gst-inspect-1.0 libcamerasrc &>/dev/null; then
+            echo "  libcamerasrc: loads OK"
+        else
+            echo "  libcamerasrc: WILL NOT LOAD —"
+            { gst-inspect-1.0 libcamerasrc 2>&1 >/dev/null | tail -5 | sed 's/^/    /'; } || true
+        fi
+    fi
+
+    # The Software ISP debayers on the GPU via EGL, and on a hybrid laptop GLVND
+    # hands it the NVIDIA driver, which it cannot use. Everything else in this
+    # report stays green while that happens, which is exactly what made this so
+    # hard to place — so name the GPU explicitly.
+    echo
+    echo "── GPU / EGL debayer ──"
+    local gst_log="$rt/camera-relay-gst.log"
+    local gpu_debayer_failed=false hybrid_unpinned=false
+    local nodes_seen=0 saw_nvidia=false saw_mesa_drv=false
+    local rn_base rn_drv
+    while read -r rn_base rn_drv; do
+        [[ -n "$rn_base" ]] || continue
+        nodes_seen=$((nodes_seen + 1))
+        echo "  render node: /dev/dri/$rn_base (driver $rn_drv)"
+        case "$rn_drv" in
+            nvidia|nvidia-drm) saw_nvidia=true ;;
+            unknown) ;;
+            *) saw_mesa_drv=true ;;
+        esac
+    done < <(render_node_drivers)
+    (( nodes_seen == 0 )) && echo "  render node: NONE — no /dev/dri/renderD*, the GPU debayer cannot run at all"
+
+    local vd vf vlib
+    for vd in /etc/glvnd/egl_vendor.d /usr/share/glvnd/egl_vendor.d; do
+        [[ -d "$vd" ]] || continue
+        for vf in "$vd"/*.json; do
+            [[ -f "$vf" ]] || continue
+            # Assigned first, not inlined: `$(grep … | head -1 || echo '?')` binds
+            # the || to head, which exits 0 on empty input, so the fallback never
+            # fires and an ICD with no library_path renders as empty parens.
+            vlib=$(grep -oP '"library_path"\s*:\s*"\K[^"]+' "$vf" 2>/dev/null | head -1) || vlib=""
+            echo "  EGL vendor ICD: $vf (${vlib:-no library_path})"
+        done
+    done
+
+    # GLVND loads these in the order printed above, so an NVIDIA ICD sorting
+    # first is not a curiosity — it is the bug.
+    local want_pin="" unit_pin="" env_pin="${__EGL_VENDOR_LIBRARY_FILENAMES:-}"
+    want_pin=$(detect_egl_vendor_pin) || want_pin=""
+    if systemctl --user cat "$SERVICE_NAME" &>/dev/null; then
+        unit_pin=$(systemctl --user cat "$SERVICE_NAME" 2>/dev/null \
+            | grep -oP '^Environment=__EGL_VENDOR_LIBRARY_FILENAMES=\K.*' | tail -1) || unit_pin=""
+    fi
+    if $saw_nvidia && $saw_mesa_drv; then
+        echo "  topology: HYBRID (NVIDIA dGPU + Mesa-driven iGPU)"
+    elif $saw_nvidia; then
+        echo "  topology: NVIDIA only"
+    elif (( nodes_seen > 0 )); then
+        echo "  topology: single Mesa-driven GPU — no vendor pin needed"
+    fi
+    echo "  vendor pin (this shell):   ${env_pin:-none}"
+    echo "  vendor pin (service unit): ${unit_pin:-none}"
+
+    # The mode decides whether the pin matters at all: LIBCAMERA_SOFTISP_MODE=cpu
+    # skips EGL entirely. The installers write that to /etc/environment.d for the
+    # PipeWire path, systemd's user environment generator feeds it into the user
+    # manager, and this service inherits it — so a pin can be present and inert.
+    # Report all three layers, because only the effective one is the answer.
+    local unit_mode="" inherited_mode="" mode_file="" mf effective_mode
+    if systemctl --user cat "$SERVICE_NAME" &>/dev/null; then
+        unit_mode=$(systemctl --user cat "$SERVICE_NAME" 2>/dev/null \
+            | grep -oP '^Environment=LIBCAMERA_SOFTISP_MODE=\K.*' | tail -1) || unit_mode=""
+    fi
+    inherited_mode=$(systemctl --user show-environment 2>/dev/null \
+        | grep -oP '^LIBCAMERA_SOFTISP_MODE=\K.*' | tail -1) || inherited_mode=""
+    [[ -z "$inherited_mode" ]] && inherited_mode="${LIBCAMERA_SOFTISP_MODE:-}"
+    for mf in /etc/environment.d/*.conf "$HOME/.config/environment.d"/*.conf; do
+        [[ -f "$mf" ]] || continue
+        if grep -q '^LIBCAMERA_SOFTISP_MODE=' "$mf" 2>/dev/null; then
+            mode_file="$mf"
+            break
+        fi
+    done
+    if [[ -n "$unit_mode" ]]; then
+        effective_mode="$unit_mode (from the service unit)"
+    elif [[ -n "$inherited_mode" ]]; then
+        effective_mode="$inherited_mode (inherited${mode_file:+ from $mode_file})"
+    else
+        effective_mode="gpu (libcamera default, nothing set)"
+    fi
+    echo "  debayer mode (service unit): ${unit_mode:-none}"
+    echo "  debayer mode (inherited):    ${inherited_mode:-none}${mode_file:+  ($mode_file)}"
+    echo "  debayer mode (effective):    $effective_mode"
+    if [[ -n "$unit_pin" && -z "$unit_mode" && "$inherited_mode" == "cpu" ]]; then
+        echo "  → PIN IS INERT. CPU debayer touches no EGL at all, so the vendor pin"
+        echo "    above has no effect, and you are paying its framerate cost anyway."
+        echo "    The unit needs its own Environment=LIBCAMERA_SOFTISP_MODE=gpu to"
+        echo "    outrank the inherited value:"
+        echo "    camera-relay disable-persistent && camera-relay enable-persistent"
+    fi
+
+    if [[ -n "$want_pin" && -z "$unit_pin" ]]; then
+        hybrid_unpinned=true
+        echo "  → HYBRID GPU WITH NO PIN. GLVND loads the NVIDIA ICD first, so the"
+        echo "    Software ISP's EGL debayer runs on NVIDIA's driver and fails."
+        echo "    Fix: camera-relay disable-persistent && camera-relay enable-persistent"
+        echo "    (or drop in Environment=__EGL_VENDOR_LIBRARY_FILENAMES=$want_pin)"
+    fi
+
+    # What the pipeline actually got, rather than what it should have got.
+    # Both logs, because the pipeline lives in a different process per mode:
+    # always-on runs gst-launch from start_pipeline() into camera-relay-gst.log,
+    # while on-demand — the default — runs it under camera-relay-monitor and
+    # everything lands in camera-relay.log. Reading only the first one missed
+    # libcamera's EGL banner, and the debayer failure, in the common mode.
+    local pipe_logs=() lf_egl
+    for lf_egl in "$gst_log" "$rt/camera-relay.log"; do
+        [[ -s "$lf_egl" ]] && pipe_logs+=("$lf_egl")
+    done
+    if (( ${#pipe_logs[@]} == 0 )); then
+        echo "  pipeline EGL: no relay log yet — start the relay and retry"
+    else
+        local egl_lines bench_line
+        egl_lines=$(grep -haoE '(EGL_VENDOR|EGL_VERSION|GL_VERSION|GL_RENDERER):.*' \
+            "${pipe_logs[@]}" 2>/dev/null | tail -4) || egl_lines=""
+        if [[ -n "$egl_lines" ]]; then
+            echo "  pipeline EGL (from ${pipe_logs[*]}):"
+            printf '%s\n' "$egl_lines" | sed 's/^/    /'
+        else
+            echo "  pipeline EGL: not reported in ${pipe_logs[*]}"
+            echo "    (CPU debayer, or the pipeline never got that far)"
+        fi
+        # Proof that frames are really going through the debayer, not just that
+        # it initialised — libcamera prints this once it has processed a batch.
+        bench_line=$(grep -ha 'Debayer processed' "${pipe_logs[@]}" 2>/dev/null | tail -1) || bench_line=""
+        [[ -n "$bench_line" ]] && echo "  debayer throughput: ${bench_line#*INFO }"
+        if grep -haq 'debayerGPU failed\|glFrameBufferTexture2D error' "${pipe_logs[@]}" 2>/dev/null; then
+            gpu_debayer_failed=true
+            echo "  → GPU DEBAYER FAILED — this is why no picture reaches the loopback:"
+            { grep -ha 'debayerGPU failed\|glFrameBufferTexture2D error' "${pipe_logs[@]}" 2>/dev/null \
+                | tail -3 | sed 's/^/    /'; } || true
+            echo "    The sensor still powers on (privacy LED lit) and the relay still"
+            echo "    reports STREAMING, but every frame is dropped in Bayer→RGB."
+            if [[ -n "$want_pin" ]]; then
+                echo "    Fix: pin EGL to the iGPU — $want_pin"
+            else
+                echo "    Fix: LIBCAMERA_SOFTISP_MODE=cpu in the service unit (slower, always works)"
+            fi
+        fi
+    fi
+
+    echo
+    echo "── v4l2loopback ──"
+    # The module's reference count is the cheapest proof that something really
+    # has the loopback open. `status` only checks that the relay's PID is alive,
+    # so it can report STREAMING while no process holds the device and no frame
+    # has ever been written — which is exactly the state issue #65 reported.
+    local refcount=""
+    if grep -q '^v4l2loopback ' /proc/modules 2>/dev/null; then
+        refcount=$(awk '$1 == "v4l2loopback" { print $3 }' /proc/modules 2>/dev/null)
+        echo "  module: loaded (refcount ${refcount:-?})"
+        if [[ "$refcount" == "0" ]]; then
+            echo "  → refcount 0: NO process has the loopback open, so nothing can be"
+            echo "    writing frames to it. If the relay says STREAMING below, its"
+            echo "    pipeline is not attached to this device."
+        fi
+    else
+        echo "  module: NOT LOADED"
+    fi
+    local dev=""
+    if dev=$(detect_loopback_device 2>/dev/null); then
+        echo "  device: $dev ($(cat "/sys/class/video4linux/$(basename "$dev")/name" 2>/dev/null || echo '?'))"
+        if command -v v4l2-ctl &>/dev/null; then
+            echo "  current format:"
+            { v4l2-ctl -d "$dev" -V 2>&1 | sed 's/^/    /'; } || true
+        fi
+    else
+        echo "  device: NONE FOUND — nothing for apps to open"
+    fi
+
+    echo
+    echo "── Relay ──"
+    { cmd_status 2>&1 | sed 's/^/  /'; } || true
+    if [[ -x "$MONITOR_BIN" ]]; then
+        echo "  monitor binary: $MONITOR_BIN"
+    else
+        echo "  monitor binary: MISSING ($MONITOR_BIN) — on-demand mode cannot start"
+    fi
+    if systemctl --user cat "$SERVICE_NAME" &>/dev/null; then
+        # is-enabled/is-active print their answer AND exit non-zero when the
+        # answer is negative, so `|| echo ...` would print it a second time.
+        echo "  service: $(systemctl --user is-enabled "$SERVICE_NAME" 2>/dev/null || true)/$(systemctl --user is-active "$SERVICE_NAME" 2>/dev/null || true)"
+    else
+        echo "  service: not installed"
+    fi
+
+    # The decisive check. Everything above can look healthy while the loopback
+    # carries nothing, which is indistinguishable from a broken camera when all
+    # you have to go on is the browser saying "no camera".
+    echo
+    echo "── Frames on the loopback ──"
+    if [[ -z "$dev" ]]; then
+        echo "  skipped: no loopback device"
+    elif ! command -v v4l2-ctl &>/dev/null; then
+        echo "  skipped: v4l2-ctl not installed (v4l-utils)"
+    else
+        # Keep only the tail of the stream: the first frames of an on-demand
+        # start are the monitor's black placeholders while the pipeline spins up.
+        local frame="$rt/camera-relay-doctor-frame.bin"
+        timeout 15 v4l2-ctl -d "$dev" --stream-mmap --stream-count=60 \
+            --stream-to=- 2>/dev/null | tail -c 262144 > "$frame" || true
+        local size=0
+        [[ -f "$frame" ]] && size=$(stat -c %s "$frame" 2>/dev/null || echo 0)
+        # A black picture with the relay "up" is the signature of the hybrid-GPU
+        # debayer failure, so say so here instead of leaving it to the reader to
+        # connect this section with the EGL one.
+        gpu_note() {
+            if $gpu_debayer_failed; then
+                echo "  → CAUSE: the GPU debayer failed (see 'GPU / EGL debayer' above)."
+                echo "    Nothing is wrong with the sensor or the loopback."
+            elif $hybrid_unpinned; then
+                echo "  → LIKELY CAUSE: hybrid GPU with no EGL vendor pin (see above)."
+                echo "    Re-run 'camera-relay enable-persistent' and check again."
+            fi
+        }
+        if (( size == 0 )); then
+            echo "  NO FRAMES — the device exists but nothing is writing to it."
+            echo "  → the relay is not feeding the loopback. Check the logs below."
+            gpu_note
+        else
+            local distinct
+            distinct=$(od -An -tu1 "$frame" 2>/dev/null | tr -s ' ' '\n' \
+                | sed '/^$/d' | sort -u | wc -l) || distinct=0
+            if (( distinct <= 4 )); then
+                echo "  BLANK FRAMES — $size bytes captured, only $distinct distinct byte values."
+                echo "  → apps can open the device but the picture is uniform (black)."
+                echo "    The relay is holding the device open; the camera pipeline is not producing."
+                gpu_note
+            else
+                echo "  REAL PICTURE — $size bytes captured, $distinct distinct byte values."
+                echo "  → the relay side is working end to end. If a browser still shows no"
+                echo "    camera, the problem is browser-side (see below), not the relay."
+            fi
+        fi
+        unset -f gpu_note
+        rm -f "$frame"
+    fi
+
+    echo
+    echo "── Browsers ──"
+    local b bpath chromium_family=false
+    for b in firefox chromium chromium-browser brave-browser google-chrome; do
+        bpath=$(command -v "$b" 2>/dev/null) || continue
+        [[ "$b" != firefox ]] && chromium_family=true
+        if command -v snap &>/dev/null && snap list "$b" &>/dev/null; then
+            echo "  $b: snap — confined; needs 'snap connect $b:camera'"
+        else
+            echo "  $b: $bpath"
+        fi
+    done
+
+    # Firefox, reported the same way the Chromium flag is below. The install
+    # summary promises "the flag state per browser" and this half of it was
+    # missing entirely: on a Firefox-only machine the whole browser section
+    # below is skipped, so doctor said nothing about browsers at all.
+    #
+    # Which value is correct is not ours to assert. Firefox reads the relay node
+    # directly and normally needs no pref, but on Fedora 44 the camera has only
+    # been made to work with it ENABLED (issue #37), so this reports and points
+    # at the README instead of prescribing.
+    local ff_root ff_prefs ff_kind ff_state ff_seen=false
+    for ff_root in "$HOME/.mozilla/firefox" \
+                   "$HOME"/snap/firefox/common/.mozilla/firefox \
+                   "$HOME"/.var/app/org.mozilla.firefox/.mozilla/firefox; do
+        [[ -d "$ff_root" ]] || continue
+        case "$ff_root" in
+            "$HOME"/snap/*)     ff_kind=" (snap)" ;;
+            "$HOME"/.var/app/*) ff_kind=" (flatpak)" ;;
+            *)                  ff_kind="" ;;
+        esac
+        # An unmatched glob stays literal under bash, hence the -f guard.
+        for ff_prefs in "$ff_root"/*/prefs.js; do
+            [[ -f "$ff_prefs" ]] || continue
+            ff_state=$(firefox_pipewire_pref_state "$ff_prefs") || continue
+            ff_seen=true
+            ff_prefs=${ff_prefs%/prefs.js}
+            echo "  Firefox${ff_kind} PipeWire pref: $ff_state  [${ff_prefs##*/}]"
+        done
+    done
+    if $ff_seen; then
+        echo "    about:config → media.webrtc.camera.allow-pipewire. Firefox rewrites"
+        echo "    prefs.js on exit, so edit it there, not in the file."
+        echo "    No single right value: Firefox reads the relay node directly and"
+        echo "    usually needs no pref, but on Fedora the camera has only been made"
+        echo "    to work with it enabled — see issue #37 in the README."
+    fi
+
+    # Ask the flag tool what it sees, and let that widen the net. Deriving
+    # "is this a Chromium machine?" from `command -v` over a five-binary list
+    # misses Vivaldi-only, Edge-only and flatpak-only installs — machines whose
+    # profiles the installer edited but which would get none of the diagnostics
+    # below. A profile on disk is the better signal.
+    local flag_tool="" flag_status=""
+    if [[ -x /usr/local/bin/chromium-pipewire-camera ]]; then
+        flag_tool=/usr/local/bin/chromium-pipewire-camera
+        flag_status=$("$flag_tool" status 2>/dev/null) || flag_status=""
+        [[ "$flag_status" == *"No Chromium-family"* ]] && flag_status=""
+        [[ -n "$flag_status" ]] && chromium_family=true
+    fi
+
+    # Whether Chromium can see the loopback is not a matter of opinion: it
+    # applies a fixed capability test in
+    # media/capture/video/linux/video_capture_device_factory_v4l2.cc —
+    #
+    #   (capabilities & VIDEO_CAPTURE && !(capabilities & VIDEO_OUTPUT)) ||
+    #   (capabilities & DEVICE_CAPS &&
+    #    device_caps  & VIDEO_CAPTURE && !(device_caps  & VIDEO_OUTPUT))
+    #
+    # so we can evaluate the same expression here rather than guess. Under
+    # exclusive_caps=0 the relay reports both CAPTURE and OUTPUT, every branch
+    # fails, and the node is filtered out before any permission prompt —
+    # enumerateDevices() simply returns no videoinput. Firefox accepts dual caps
+    # and reads the node directly, which is the whole reason the two disagree.
+    if $chromium_family && [[ -n "$dev" ]] && command -v v4l2-ctl &>/dev/null; then
+        # Not named `info`: that is this script's own logging function, and a
+        # local of the same name shadows it for the rest of the block.
+        local caps_hex devcaps_hex caps_info visible=1
+        caps_info=$(v4l2-ctl -d "$dev" --info 2>/dev/null) || caps_info=""
+        caps_hex=$(awk '/^\tCapabilities/ { print $3; exit }' <<< "$caps_info")
+        devcaps_hex=$(awk '/^\tDevice Caps/ { print $4; exit }' <<< "$caps_info")
+        if [[ -n "$caps_hex" ]]; then
+            local caps=$((caps_hex)) devcaps=0
+            [[ -n "$devcaps_hex" ]] && devcaps=$((devcaps_hex))
+            if (( (caps & 0x1) && !(caps & 0x2) )); then
+                visible=0
+            elif (( (caps & 0x80000000) && (devcaps & 0x1) && !(devcaps & 0x2) )); then
+                visible=0
+            fi
+            echo
+            if (( visible == 0 )); then
+                echo "  Direct V4L2: the relay node passes Chromium's capability test."
+            else
+                echo "  Direct V4L2: Chromium CANNOT see $dev."
+                echo "    It reports VIDEO_CAPTURE and VIDEO_OUTPUT together"
+                echo "    (caps $caps_hex, device caps ${devcaps_hex:-n/a}), and Chromium"
+                echo "    only accepts a node that reports capture WITHOUT output."
+                echo "    This is expected under exclusive_caps=0 and affects Chrome,"
+                echo "    Chromium, Brave, Edge and every Electron app. Firefox is fine."
+                echo "    → those browsers need the PipeWire path below instead."
+            fi
+        fi
+    fi
+
+    # The PipeWire path is the way out, so report whether it is actually usable
+    # rather than telling the user to flip a flag and hope.
+    if $chromium_family; then
+        local pw_source=""
+        if command -v pw-dump &>/dev/null && command -v python3 &>/dev/null; then
+            pw_source=$(pw-dump 2>/dev/null | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+for obj in data:
+    props = (obj.get("info") or {}).get("props") or {}
+    if props.get("media.class") == "Video/Source":
+        print(props.get("node.description") or props.get("node.name") or "?")
+        break
+' 2>/dev/null) || pw_source=""
+        fi
+        if [[ -n "$pw_source" ]]; then
+            echo "  PipeWire camera source: $pw_source"
+        else
+            echo "  PipeWire camera source: NONE — the flag below has nothing to consume."
+        fi
+
+        # Existing is not the same as usable. WirePlumber probes the loopback at
+        # login, before the monitor pins its format, and caches v4l2loopback's
+        # catch-all range. WebRTC needs a discrete rectangle, so a node in that
+        # state produces a camera with no resolutions — Chrome finds it and
+        # offers nothing, which looks identical to no camera at all.
+        if [[ -n "$dev" ]]; then
+            local real_fmt pw_node pw_rect
+            real_fmt=$(loopback_real_format "$dev") || real_fmt=""
+            pw_node=$(pipewire_node_for "$dev") || pw_node=""
+            if [[ -n "$real_fmt" && -n "$pw_node" ]]; then
+                local params_out
+                params_out=$(pw-cli enum-params "$pw_node" EnumFormat 2>/dev/null) || params_out=""
+                pw_rect=$(awk '/Rectangle/ { print $2; exit }' <<< "$params_out")
+                if [[ -z "$pw_rect" ]]; then
+                    echo "  PipeWire format:        could not read (node $pw_node)"
+                elif [[ "$pw_rect" == "${real_fmt##* }" ]]; then
+                    echo "  PipeWire format:        $real_fmt — matches the device"
+                else
+                    echo "  PipeWire format:        STALE — PipeWire says $pw_rect, device offers ${real_fmt##* }"
+                    echo "    WirePlumber probed the loopback before the relay pinned its format,"
+                    echo "    so it cached v4l2loopback's catch-all range. WebRTC cannot parse a"
+                    echo "    range, so Chrome finds the camera and still offers no device."
+                    echo "    → fix with: camera-relay nudge-wireplumber"
+                fi
+            fi
+        fi
+
+        # Per profile, what the flag actually is. "Consider enabling it" is not
+        # a diagnostic; whether it is set is.
+        local prof label dir state needs_flag=0
+
+        # Prefer the installed tool over re-deriving this. It already knows all
+        # ten profile locations — Chrome Beta/Unstable and the three flatpaks
+        # included — and a second hand-maintained list here is a list that
+        # drifts out of step with it.
+        if [[ -n "$flag_status" ]]; then
+            sed 's/^ */  /' <<< "$flag_status"
+            if grep -qvE 'ENABLED[[:space:]]*$' <<< "$flag_status"; then
+                needs_flag=1
+            fi
+        else
+        for prof in \
+            "Chrome|$HOME/.config/google-chrome" \
+            "Chromium|$HOME/.config/chromium" \
+            "Chromium (snap)|$HOME/snap/chromium/current/.config/chromium" \
+            "Brave|$HOME/.config/BraveSoftware/Brave-Browser" \
+            "Vivaldi|$HOME/.config/vivaldi"; do
+            label=${prof%%|*}
+            dir=${prof#*|}
+            [[ -f "$dir/Local State" ]] || continue
+            if ! command -v python3 &>/dev/null; then
+                echo "  $label PipeWire flag: unknown (python3 not installed)"
+                continue
+            fi
+            state=$(python3 -c '
+import json, re, sys
+flag = "enable-webrtc-pipewire-camera"
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        data = json.load(fh)
+except (OSError, ValueError):
+    print("unreadable")
+    sys.exit(0)
+browser = data.get("browser")
+labs = browser.get("enabled_labs_experiments") if isinstance(browser, dict) else None
+labs = labs if isinstance(labs, list) else []
+hit = [x for x in labs if isinstance(x, str) and re.match(r"^%s(@\d+)?$" % re.escape(flag), x)]
+print("DISABLED" if any(x.endswith("@2") for x in hit) else ("ENABLED" if hit else "not set"))
+' "$dir/Local State" 2>/dev/null) || state="unreadable"
+            echo "  $label PipeWire flag: $state"
+            [[ "$state" == "ENABLED" ]] || needs_flag=1
+        done
+        fi
+
+        # Only explain the fix when something still needs it. A doctor that
+        # prints the same remedy whether or not it applies trains people to
+        # skim past it.
+        if (( needs_flag )); then
+            # Prefer the installed copy: the source tree it was run from during
+            # install is usually gone by the time anyone reads this.
+            local flag_hint="camera-relay/chromium-pipewire-camera.sh"
+            [[ -n "$flag_tool" ]] && flag_hint="chromium-pipewire-camera"
+            echo "    Set it with: $flag_hint"
+            echo "    or by hand at chrome://flags/#enable-webrtc-pipewire-camera,"
+            echo "    then fully quit and reopen the browser. Needs libcamera 0.7+"
+            echo "    (this machine: $(pkg-config --modversion libcamera 2>/dev/null || echo unknown));"
+            echo "    on Ubuntu 24.04/Zorin libcamera 0.2.0 has no IPU6 support and the"
+            echo "    flag makes things worse."
+            echo "    Edge does not expose the entry in edge://flags, so there is nothing"
+            echo "    to write into its profile — launch it with"
+            echo "    --enable-features=WebRtcPipeWireCamera instead. Electron apps hit the"
+            echo "    same V4L2 filter but the switch does not help them: PipeWire camera"
+            echo "    is not wired into Electron (only the screen-share capturer is)."
+        fi
+    fi
+    if command -v flatpak &>/dev/null; then
+        { flatpak list --app --columns=application 2>/dev/null \
+            | grep -iE 'firefox|chrom|brave' | sed 's/^/  flatpak: /; s/$/ — needs --device=all/'; } || true
+    fi
+
+    echo
+    echo "── Recent logs ──"
+    local lf
+    for lf in "$rt/camera-relay-gst.log" "$rt/camera-relay.log"; do
+        if [[ -s "$lf" ]]; then
+            echo "  $lf (last 15 lines):"
+            { tail -15 "$lf" 2>/dev/null | sed 's/^/    /'; } || true
+        else
+            echo "  $lf: empty or missing"
+        fi
+    done
+    if systemctl --user cat "$SERVICE_NAME" &>/dev/null; then
+        echo "  systemctl --user status $SERVICE_NAME:"
+        { systemctl --user status "$SERVICE_NAME" --no-pager -n 15 2>&1 | sed 's/^/    /'; } || true
+    fi
+
+    return 0
+}
+
 cmd_enable_persistent() {
     local skip_confirm=false
     [[ "${1:-}" == "--yes" ]] && skip_confirm=true
 
+    # Deliberately does NOT bail out here when persistent mode is already on.
+    # The unit is not static — it carries LIBCAMERA_IPA_MODULE_PATH,
+    # GST_PLUGIN_PATH, LD_LIBRARY_PATH, LIBCAMERA_SOFTISP_MODE,
+    # __EGL_VENDOR_LIBRARY_FILENAMES and the nudge-wireplumber ExecStartPost,
+    # all computed here at install time. Returning early meant a reinstall
+    # refreshed every binary and left the unit at whatever it was first created
+    # with, so fixes that live *in the unit* shipped installed and inert while
+    # the installer reported success: the EGL pin from #76 (black camera) and
+    # the WirePlumber re-probe from v0.3.62 (no camera in Chrome) both landed
+    # that way. The quiet no-op is preserved below by comparing content, not by
+    # skipping the work. (issue #82)
+    local already=false
     if is_persistent; then
-        info "Persistent mode is already enabled"
-        return 0
+        already=true
     fi
 
-    if ! $skip_confirm; then
+    if ! $already && ! $skip_confirm; then
         echo ""
         echo "  ┌──────────────────────────────────────────────────┐"
         echo "  │           On-Demand Camera Relay                 │"
@@ -707,6 +1717,11 @@ cmd_enable_persistent() {
             *) info "Cancelled"; return 1 ;;
         esac
     fi
+
+    # The validation ladder below probes with gst-inspect-1.0; if that binary is
+    # absent every probe "fails" and we would silently bake system-only paths
+    # into the unit for a relay that cannot run at all (issue #65).
+    require_gst_tools
 
     # Detect paths for the service environment
     local ipa_path="" gst_path="" lib_path="" softisp_mode=""
@@ -754,21 +1769,50 @@ cmd_enable_persistent() {
         unset -f gst_inspect_with_env
     fi
 
-    # Detect if NVIDIA is the active EGL renderer. libcamera 0.7.0's GPU debayer
-    # (debayer_egl.cpp) is incompatible with NVIDIA's proprietary EGL driver,
-    # causing black frames. Force CPU debayer on NVIDIA systems.
-    if command -v glxinfo &>/dev/null && glxinfo 2>/dev/null | grep -qi "opengl renderer.*nvidia"; then
+    # Keep libcamera's GPU debayer off NVIDIA's EGL driver, which it cannot use
+    # (debayer_egl.cpp → glFrameBufferTexture2D error 36054 → no frames at all,
+    # while `status` still reads STREAMING). There are two ways to do that, and
+    # they cover different machines:
+    #
+    #   1. Hybrid box (iGPU + NVIDIA dGPU): pin the vendor ICD to the iGPU. The
+    #      service inherits none of the session's EGL state, so GLVND falls back
+    #      to filename order and picks 10_nvidia.json — which is why this breaks
+    #      only under systemd and looks fine when you run `cam` by hand.
+    #   2. No iGPU to fall back to: force CPU debayer. Always works, but costs a
+    #      large chunk of the framerate (issue #66), so it is the second choice.
+    #
+    # Deliberately exclusive. Setting both would leave CPU mode winning (it uses
+    # no EGL at all) and the pin dead in the unit on exactly the hybrid machines
+    # it was written for.
+    #
+    # Not choosing cpu is not enough to get gpu, though: the installers write
+    # LIBCAMERA_SOFTISP_MODE=cpu to /etc/environment.d for the PipeWire-libcamera
+    # path, systemd's 30-systemd-environment-d-generator feeds that into the user
+    # manager, and this service inherits it — which would make the pin inert
+    # exactly here. A unit-level Environment= outranks the inherited value, so
+    # the hybrid branch has to state gpu rather than merely stay silent.
+    local egl_vendor=""
+    egl_vendor=$(detect_egl_vendor_pin) || egl_vendor=""
+    if [[ -n "$egl_vendor" ]]; then
+        softisp_mode="gpu"
+        info "Hybrid GPU detected — service will pin EGL to $egl_vendor (GPU debayer on the iGPU)"
+    elif command -v glxinfo &>/dev/null && glxinfo 2>/dev/null | grep -qi "opengl renderer.*nvidia"; then
         softisp_mode="cpu"
-        info "NVIDIA GPU detected as active renderer — using CPU debayer"
+        info "NVIDIA GPU detected as active renderer, no iGPU to pin — using CPU debayer"
     elif [[ -d /proc/driver/nvidia ]] && \
          ! { command -v prime-select &>/dev/null && [[ "$(prime-select query 2>/dev/null)" == "intel" ]]; }; then
         softisp_mode="cpu"
-        info "NVIDIA GPU detected — using CPU debayer"
+        info "NVIDIA GPU detected, no iGPU to pin — using CPU debayer"
     fi
 
-    # Create systemd user service
+    # Create systemd user service. Rendered to a temp file first and compared
+    # against what is installed, so an unchanged reinstall stays a genuine
+    # no-op — no daemon-reload, no restart, no camera dropped out from under
+    # whoever is using it.
     mkdir -p "$SERVICE_DIR"
-    cat > "${SERVICE_DIR}/${SERVICE_NAME}" <<EOF
+    local unit_path="${SERVICE_DIR}/${SERVICE_NAME}"
+    local unit_tmp="${unit_path}.new"
+    cat > "$unit_tmp" <<EOF
 [Unit]
 Description=Camera Relay (on-demand libcamera to v4l2loopback)
 After=pipewire.service wireplumber.service
@@ -776,6 +1820,18 @@ After=pipewire.service wireplumber.service
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/camera-relay start --on-demand
+# WirePlumber probed the loopback at login, before the monitor pinned its
+# format (this unit is After=wireplumber.service), so it cached v4l2loopback's
+# generic catch-all format range. WebRTC's PipeWire camera path cannot parse a
+# range and ends up with a camera that has no resolutions — Chrome finds the
+# node and still offers no device. Re-probe, but only when the formats really
+# do disagree. See nudge_wireplumber in this script.
+#
+# Leading '-': advisory. A camera that works for every V4L2 app is worth more
+# than this correction, so nothing here may take the relay down — including the
+# case where this unit was regenerated but /usr/local/bin/camera-relay is still
+# an older copy that does not know the subcommand.
+ExecStartPost=-/usr/local/bin/camera-relay nudge-wireplumber
 ExecStop=/usr/local/bin/camera-relay stop
 Restart=on-failure
 RestartSec=5
@@ -783,12 +1839,40 @@ ${ipa_path:+Environment=LIBCAMERA_IPA_MODULE_PATH=$ipa_path}
 ${gst_path:+Environment=GST_PLUGIN_PATH=$gst_path}
 ${lib_path:+Environment=LD_LIBRARY_PATH=$lib_path}
 ${softisp_mode:+Environment=LIBCAMERA_SOFTISP_MODE=$softisp_mode}
+${egl_vendor:+Environment=__EGL_VENDOR_LIBRARY_FILENAMES=$egl_vendor}
 
 [Install]
 WantedBy=default.target
 EOF
 
+    local unit_changed=true
+    if [[ -f "$unit_path" ]] && cmp -s "$unit_tmp" "$unit_path"; then
+        unit_changed=false
+    fi
+    if $unit_changed; then
+        mv -f "$unit_tmp" "$unit_path"
+    else
+        rm -f "$unit_tmp"
+    fi
+
+    if $already && ! $unit_changed; then
+        info "Persistent mode is already enabled (service unit is up to date)"
+        return 0
+    fi
+
     systemctl --user daemon-reload
+
+    if $already; then
+        # Already enabled, but the unit content moved. Restart, or the running
+        # relay keeps the old environment until the next login — which is how
+        # the EGL pin stayed inert on machines that had the fix installed.
+        info "Service unit changed — restarting the relay to pick it up"
+        systemctl --user enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+        systemctl --user restart "$SERVICE_NAME"
+        info "On-demand relay updated and restarted"
+        return 0
+    fi
+
     systemctl --user enable --now "$SERVICE_NAME"
 
     info "On-demand relay enabled"
@@ -823,6 +1907,7 @@ Commands:
   stop                  Stop the camera relay
   status                Show relay status
   status --json         Show status as JSON
+  doctor                Full diagnostic report (paste this into a bug report)
   enable-persistent     Auto-start on-demand relay on login
   enable-persistent --yes  Skip confirmation prompt
   disable-persistent    Remove auto-start
@@ -840,6 +1925,8 @@ case "${1:-}" in
     start)              cmd_start "${2:-}" ;;
     stop)               cmd_stop ;;
     status)             cmd_status "${2:-}" ;;
+    doctor)             cmd_doctor ;;
+    nudge-wireplumber)  cmd_nudge_wireplumber ;;
     enable-persistent)  cmd_enable_persistent "${2:-}" ;;
     disable-persistent) cmd_disable_persistent ;;
     -h|--help|help)     usage ;;

@@ -167,13 +167,14 @@ libcamera on IPU7 currently supports only one client at a time. If Firefox is us
 
 ### Browser & App Compatibility
 
-With `exclusive_caps=0` (the default), browsers work best using V4L2 directly through the camera relay:
+Apps split into two groups, and which group a browser lands in is not a matter of
+configuration — see [Chromium can't use the V4L2 relay](#chromium-cant-use-the-v4l2-relay) below.
 
 | App | Status | Notes |
 |-----|--------|-------|
-| **Firefox** | Working | Works via PipeWire (no flags needed) |
-| **Chrome / Chromium / Brave** | Working | Works via V4L2 camera relay |
-| **Edge** | Working | Works via V4L2 camera relay only |
+| **Firefox** | Working | Reads the V4L2 relay directly on Ubuntu — no flags. On Fedora the PipeWire pref is required ([#37](https://github.com/Andycodeman/samsung-galaxy-book-linux-fixes/issues/37)) |
+| **Chrome / Chromium / Brave** | Working | **Only** via PipeWire — the installer enables the flag for you |
+| **Edge** | Works, but not automatically | Same V4L2 filter as Chrome. `edge://flags` does not expose the entry, so the installer cannot set it — launch with `--enable-features=WebRtcPipeWireCamera` instead |
 | **Zoom / OBS / VLC** | Working | Uses V4L2 camera relay |
 | **Cheese** | Crashes | Use standalone fix: `cd ../camera-relay && ./cheese-fix.sh` |
 
@@ -202,18 +203,192 @@ media.navigator.video.default_width = 1920
 media.navigator.video.default_height = 1080
 ```
 
-**Chrome / Chromium / Edge:** These browsers work via the V4L2 camera relay without any special flags. Make sure the relay is running:
-```bash
-camera-relay status
-camera-relay enable-persistent --yes  # if not enabled
+#### Firefox: `NotAllowedError` on every camera request (stale portal permission)
+
+If you've set `media.webrtc.camera.allow-pipewire = true` and Firefox then fails on *every*
+camera request with:
+
+```
+NotAllowedError: The request is not allowed by the user agent or the platform in the current context.
 ```
 
-If Chrome still shows "waiting for your permission" without a prompt, try:
+…while other apps (Chrome, OBS) have camera access fine, you have a **stale "denied" entry** for
+Firefox in the xdg-desktop-portal permission store. It gets left behind when the portal crashes
+mid-negotiation (e.g. the glib2 `g_weak_ref_get` race in xdg-desktop-portal 1.21.0 on Fedora 44):
+the permission grant fails and is recorded as a *denial*, which then silently blocks every future
+request — even after the portal is fixed.
+
+Check for it:
+
+```bash
+busctl call --user org.freedesktop.impl.portal.PermissionStore \
+  /org/freedesktop/impl/portal/PermissionStore \
+  org.freedesktop.impl.portal.PermissionStore \
+  Lookup ss "devices" "camera"
+```
+
+If you see `"org.mozilla.firefox" 1 "no"` in the output, delete it:
+
+```bash
+busctl call --user org.freedesktop.impl.portal.PermissionStore \
+  /org/freedesktop/impl/portal/PermissionStore \
+  org.freedesktop.impl.portal.PermissionStore \
+  DeletePermission sss "devices" "camera" "org.mozilla.firefox"
+```
+
+Restart Firefox; it will prompt for camera access on the next request and grant it normally. No
+restart of xdg-desktop-portal is needed.
+
+*Note:* turning the pref back off is **not** a general way around this, and the earlier
+revision of this section that suggested it was wrong. Firefox can read the relay node directly,
+but on Fedora 44 the reporter measured that it does not:
+
+| `media.webrtc.camera.allow-pipewire` | Result |
+| --- | --- |
+| `true` | both **Camera Relay** and **Built-in Front Camera** work |
+| `false` | no camera works — `NotReadableError: Starting videoinput failed` |
+
+`NotReadableError` means Firefox found a node and could not start it — a different failure from
+the `NotAllowedError` above, and one this installer has an outstanding suspect for: unlike
+`webcam-fix-libcamera`, it ships neither the `camera-relay` group nor the
+`74-camera-relay-mc-nodes.rules` udev rule, so the raw IPU7 media-controller nodes stay openable
+by your user and Firefox can pick one that will never stream. That is
+[#70](https://github.com/Andycodeman/samsung-galaxy-book-linux-fixes/issues/70), still unconfirmed.
+
+So on Fedora: delete the stale PermissionStore entry and leave the pref **on**. Thanks to
+[@david-bartlett](https://github.com/david-bartlett) ([#37](https://github.com/Andycodeman/samsung-galaxy-book-linux-fixes/issues/37)).
+
+**Chrome / Chromium / Brave:** see the next section — these need the PipeWire
+flag, which the installer sets for you. If Chrome shows "waiting for your
+permission" without a prompt but *does* list the camera, try:
 1. Go to `chrome://settings/content/camera` and ensure the correct camera is selected
 2. Clear site permissions for the page you're testing
 3. Try an Incognito window (to rule out extension conflicts)
 
-**Note:** The PipeWire camera flag (`chrome://flags/#enable-webrtc-pipewire-camera`) is **not recommended** — community testing found it can prevent Chromium browsers from seeing the camera, and Edge doesn't support it at all. Only try it as a last resort, and disable it if it causes problems.
+### Chromium can't use the V4L2 relay
+
+Chrome, Chromium, Brave, Edge and every Electron app filter the camera relay out
+of their device list before you ever see a permission prompt —
+`navigator.mediaDevices.enumerateDevices()` simply returns no `videoinput`.
+
+This is not a permission, sandbox or relay problem. Chromium's V4L2 enumeration
+([`video_capture_device_factory_v4l2.cc`](https://chromium.googlesource.com/chromium/src/+/refs/heads/main/media/capture/video/linux/video_capture_device_factory_v4l2.cc))
+accepts a node only when it reports capture and **not** output:
+
+```c
+(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE &&
+ !(cap.capabilities & V4L2_CAP_VIDEO_OUTPUT)) ||
+(cap.capabilities & V4L2_CAP_DEVICE_CAPS &&
+ cap.device_caps & V4L2_CAP_VIDEO_CAPTURE &&
+ !(cap.device_caps & V4L2_CAP_VIDEO_OUTPUT))
+```
+
+The relay is created with `exclusive_caps=0`, so it advertises both
+(`v4l2-ctl -d /dev/videoN --info` shows `Video Capture` *and* `Video Output`
+under `Device Caps`) and every branch fails. Firefox accepts dual caps and reads
+the node directly, which is exactly why Firefox works out of the box and Chrome
+shows nothing. Snap and flatpak browsers are additionally sandboxed away from
+`/dev/video*`.
+
+**The fix** is to route those browsers through PipeWire, where WirePlumber
+publishes the relay as an ordinary camera source. The installer does this, and
+you can run it any time:
+
+```bash
+chromium-pipewire-camera          # installed to /usr/local/bin by the installer
+```
+
+You will usually need to, because it skips any profile whose browser is open —
+which it normally is during an install. (From an unpacked source tree the same
+script is `camera-relay/chromium-pipewire-camera.sh`.)
+
+It enables `chrome://flags/#enable-webrtc-pipewire-camera` in each browser's
+`Local State` (backing the file up first); you can also set that flag by hand.
+Either way the browser must be **fully quit** first — Chromium rewrites
+`Local State` from memory on exit and would discard the change — and restarted
+afterwards, since it caches its device list at startup. Confirmed on a
+960QHA / Kubuntu 26.04 in [issue #65](https://github.com/Andycodeman/samsung-galaxy-book-linux-fixes/issues/65).
+
+`camera-relay doctor` reports the node's actual capabilities, whether PipeWire
+publishes a camera source, and whether the flag is set per browser.
+
+#### The second half: WirePlumber's stale format list
+
+The flag alone is not enough, because a second timing bug sits behind it.
+
+`v4l2loopback` is loaded at boot with no producer attached, so it advertises a
+generic catch-all format set — `BGRx`/`xRGB` at any size from 2x1 to 8192x8192,
+expressed as a `Choice:Range`. The relay's monitor only pins `YUYV 1920x1080`
+when it starts at login, and `camera-relay.service` is ordered
+`After=wireplumber.service` — so WirePlumber has already probed the unconfigured
+device, cached that generic list, and will never look again.
+
+Firefox never notices, because it reads `/dev/video0` directly. WebRTC's PipeWire
+camera path needs a *discrete* rectangle out of `SPA_PARAM_EnumFormat`; a range
+yields no usable resolution, so the camera arrives with zero capabilities. Chrome
+logs the camera and then offers no device — indistinguishable from no camera:
+
+```
+camera_portal.cc:215]    Camera access granted by the XDG portal.
+pipewire_session.cc:99]  Found Camera: Camera Relay (V4L2)
+```
+```js
+await navigator.mediaDevices.getUserMedia({video:true})
+// NotFoundError: Requested device not found
+```
+
+Compare the two views to spot it:
+
+```bash
+v4l2-ctl -d /dev/videoN --list-formats-ext   # what the device really offers
+pw-cli enum-params <node-id> EnumFormat      # what PipeWire thinks it offers
+```
+
+There is no lighter re-probe available — the V4L2 monitor is udev-driven, nodes
+are built at discovery, and WirePlumber exposes no "re-probe this device" call.
+Restarting it is the documented answer; see *"`device.capabilities` is read-only
+in PipeWire"* in [the legacy fix](../webcam-fix/README.md#step-9-fix-pipewire-device-classification),
+which hit the same class of bug.
+
+The relay handles this itself, from `ExecStartPost`: it waits for the monitor to
+pin the format, compares it against what PipeWire advertises, and restarts
+WirePlumber **only** when they disagree — so restarting the relay by hand costs
+no audio glitch when things are already correct. Run it manually with:
+
+```bash
+camera-relay nudge-wireplumber
+```
+
+Two things this does **not** fix:
+
+- **Edge** does not expose the entry in `edge://flags`, so there is nothing for
+  the installer to write into its profile. The underlying Chromium feature is
+  still compiled in, so the command-line switch works — edit the `Exec=` line of
+  `microsoft-edge.desktop`, or launch it as:
+
+  ```bash
+  microsoft-edge --enable-features=WebRtcPipeWireCamera
+  ```
+
+- **Electron apps** (Slack, Discord, Teams, VS Code) are a different case: they
+  hit the same V4L2 filter, but the switch does **not** help, because PipeWire
+  *camera* support is not wired into Electron — only the screen-share capturer
+  is ([electron#45058](https://github.com/electron/electron/issues/45058) is a
+  closed, unimplemented request). Nothing in this repo fixes them today.
+- **libcamera 0.2.0** (Ubuntu 24.04 Noble / Zorin) has no IPU6/IPU7 support, so
+  the PipeWire path produces no frames either. Check with
+  `pkg-config --modversion libcamera`; the script refuses below 0.7, and that is
+  where the older "keep the flag disabled" advice came from.
+
+> **Why not `exclusive_caps=1`?** It would make the node advertise capture only
+> and fix every Chromium app at once, with no flag. The relay deliberately moved
+> away from it: with `exclusive_caps=1` WirePlumber classifies the node as an
+> output at boot, before the relay attaches, and the PipeWire path breaks instead
+> — trading one broken set of apps for another. See the note above
+> `nudge_wireplumber` in `camera-relay/camera-relay`.
+
+If enabling it makes things worse, set it back to Disabled — it is a per-browser
+setting and changes nothing system-wide.
 
 ### VLC / Zoom / OBS don't see the camera
 
@@ -323,6 +498,75 @@ Replace `/dev/video0` with your camera device (e.g. `/dev/video32` for the relay
 ---
 
 ## Troubleshooting
+
+### Start here: `camera-relay doctor`
+
+```bash
+camera-relay doctor
+```
+
+One command, one block of output, covering every layer between the sensor and
+the browser: tools, libcamera, the loopback device, relay state, the systemd
+unit, recent GStreamer logs, and browser sandboxing. The section that matters
+most is **Frames on the loopback**, which grabs a live frame and reports one of:
+
+| Result | Meaning |
+| --- | --- |
+| `NO FRAMES` | The device exists but nothing is writing to it — the relay is not running or its pipeline died. Read the logs printed below it. |
+| `BLANK FRAMES` | Apps can open the device but the picture is uniform black — the relay holds the device, the camera pipeline is not producing. |
+| `REAL PICTURE` | The relay works end to end. If a browser still shows no camera, the problem is browser-side (snap/flatpak confinement, or the browser needs restarting). |
+
+This is worth running *before* anything else below, and worth pasting in full
+into a bug report. `gst-launch-1.0 ... autovideosink` showing a picture proves
+the camera works but says nothing about the loopback, which is the part
+browsers actually read. (issue #65)
+
+### LED on but black image, on RTX models
+
+The Book5 Pro ships in RTX dGPU configurations, and those run the same
+libcamera Software ISP as the Book4 Ultra — so they hit the same hybrid-GPU
+bug. The privacy LED lights, `camera-relay status` says `STREAMING`, and apps
+get a black picture, because GLVND loads `10_nvidia.json` ahead of
+`50_mesa.json` and the EGL debayer lands on NVIDIA's driver:
+
+```
+ERROR eGL egl.cpp:134 glFrameBufferTexture2D error 36054
+ERROR Debayer debayer_egl.cpp:639 debayerGPU failed
+```
+
+It only shows up under systemd — `cam` from a terminal works, because a desktop
+session usually has EGL already resolved to Mesa.
+
+`camera-relay enable-persistent` detects the hybrid setup and pins the vendor
+ICD to the iGPU in `camera-relay.service`, and `camera-relay doctor` reports the
+whole picture under **GPU / EGL debayer**. On an install from before this
+landed, regenerate the unit:
+
+```bash
+camera-relay disable-persistent && camera-relay enable-persistent
+```
+
+Full write-up, including the manual drop-in and the PipeWire-path caveat:
+[../webcam-fix-libcamera/README.md](../webcam-fix-libcamera/README.md) →
+*"LED on but black image, on laptops with a dedicated GPU"*.
+
+### `camera-relay start` says `libcamerasrc element not found` — but it's installed
+
+If the plugin package is already the newest version and
+`gst-launch-1.0 libcamerasrc ! videoconvert ! autovideosink` shows a working
+picture, the missing piece is the **GStreamer command-line tools**, not the
+libcamera plugin. `gst-launch-1.0` *is* the relay pipeline, and it ships
+separately from `gstreamer1.0-libcamera`:
+
+```bash
+sudo apt install gstreamer1.0-tools     # Ubuntu/Debian
+sudo dnf install gstreamer1             # Fedora
+sudo pacman -S gstreamer                # Arch
+camera-relay start
+```
+
+Current installers pull this in automatically; installs made before that need it
+by hand. (issue #65)
 
 ### `cam -l` shows no cameras
 

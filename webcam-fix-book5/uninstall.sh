@@ -102,6 +102,28 @@ sudo rm -f /etc/udev/rules.d/70-camera-relay-capabilities.rules
 sudo udevadm control --reload-rules 2>/dev/null || true
 echo "  ✓ Udev rules removed"
 
+# Take the Chromium PipeWire camera flag back out. Left behind it would point
+# those browsers at a PipeWire camera that no longer exists.
+# Prefer the installed copy: an uninstall may well be run from a freshly
+# re-downloaded tarball, but it may equally be run from a stale checkout that
+# predates this script.
+_UNINST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_FLAG_TOOL=""
+if [[ -x /usr/local/bin/chromium-pipewire-camera ]]; then
+    _FLAG_TOOL=/usr/local/bin/chromium-pipewire-camera
+elif [[ -x "$_UNINST_DIR/../camera-relay/chromium-pipewire-camera.sh" ]]; then
+    _FLAG_TOOL="$_UNINST_DIR/../camera-relay/chromium-pipewire-camera.sh"
+fi
+if [[ -n "$_FLAG_TOOL" ]]; then
+    echo "  Reverting Chromium browser camera flag..."
+    # The running-browser guard skips any profile whose browser is open, so say
+    # what to do about that rather than leaving the flag silently behind.
+    "$_FLAG_TOOL" disable || true
+    echo "    (a browser that was open kept the flag — quit it and set"
+    echo "     chrome://flags/#enable-webrtc-pipewire-camera back to Default)"
+fi
+sudo rm -f /usr/local/bin/chromium-pipewire-camera
+
 # [7/11] Remove WirePlumber rules
 echo "[7/11] Removing WirePlumber rules..."
 sudo rm -f /etc/wireplumber/wireplumber.conf.d/50-disable-ipu7-v4l2.conf
@@ -170,6 +192,7 @@ while IFS=: read -r user _ _ _ _ home _; do
 done < <(getent passwd)
 sudo rm -f /usr/local/bin/camera-relay
 sudo rm -f /usr/local/bin/camera-relay-monitor
+sudo rm -f /usr/local/bin/camera-relay-gst
 sudo rm -rf /usr/local/share/camera-relay
 sudo rm -f /usr/share/applications/camera-relay-systray.desktop
 sudo rm -f /etc/xdg/autostart/camera-relay-systray.desktop
@@ -204,6 +227,7 @@ echo "  ✓ Camera relay tool removed"
 echo "[11/11] Removing environment configuration..."
 sudo rm -f /etc/environment.d/libcamera-ipa.conf
 sudo rm -f /etc/profile.d/libcamera-ipa.sh
+sudo rm -f /etc/environment.d/10-libcamera-softisp.conf
 echo "  ✓ Removed libcamera environment files"
 
 echo ""

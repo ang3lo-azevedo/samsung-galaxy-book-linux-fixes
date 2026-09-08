@@ -5,6 +5,17 @@
 
 set -e
 
+NO_RESTART=false
+for arg in "$@"; do
+    case "$arg" in
+        --no-restart) NO_RESTART=true ;;
+        -h|--help)
+            echo "Usage: $0 [--no-restart]"
+            echo "  --no-restart  Never restart PipeWire. Reboot to finish instead."
+            exit 0 ;;
+    esac
+done
+
 echo "=============================================="
 echo "  Webcam Fix (libcamera) Uninstaller"
 echo "=============================================="
@@ -13,6 +24,52 @@ echo ""
 if [[ $EUID -eq 0 ]]; then
     echo "ERROR: Don't run this as root. The script will use sudo where needed."
     exit 1
+fi
+
+# Hand the raw camera nodes back before anything else, mirroring the order
+# install.sh builds them up in. While 74-camera-relay-mc-nodes.rules is live the
+# nodes belong to the memberless camera-relay group and only the setgid launcher
+# can open them — so removing the launcher first opens exactly the dead-camera
+# window the installer was reordered to avoid, and `set -e` above would make it
+# permanent. This script is what someone reaches for to recover from a broken
+# state, so it is the worst possible place to leave that window.
+#
+# Reverting ownership first means a failure anywhere below lands on "the
+# spurious nodes are back and the camera works".
+echo "[0/8] Restoring raw camera node ownership..."
+sudo rm -f /etc/udev/rules.d/74-camera-relay-mc-nodes.rules
+# Earlier names for the same rule, from revisions that relied on TAG-= alone.
+sudo rm -f /etc/udev/rules.d/72-camera-relay-mc-nodes.rules \
+           /etc/udev/rules.d/90-camera-relay-mc-nodes.rules
+sudo udevadm control --reload-rules 2>/dev/null || true
+sudo udevadm trigger --action=change --subsystem-match=video4linux 2>/dev/null || true
+sudo udevadm settle 2>/dev/null || true
+
+# The trigger above is not enough on its own. It re-runs the rules — the
+# properties and the uaccess tag come back — but udev does not re-apply node
+# ownership on a change event, so every node keeps the camera-relay GID. With
+# the group deleted further down that leaves a dangling numeric GID, and if
+# that number is ever reused the nodes silently become reachable again.
+#
+# So restore the group explicitly rather than hoping udev does it. Nodes are
+# matched by GID, not by name, so this also repairs a system left dangling by
+# an earlier run of this script.
+_cr_gid=$(getent group camera-relay 2>/dev/null | cut -d: -f3)
+_restored=0
+for _v in /dev/video*; do
+    [[ -e "$_v" ]] || continue
+    _gid=$(stat -c%g "$_v" 2>/dev/null) || continue
+    # Either still owned by camera-relay, or owned by a GID that no longer
+    # resolves — both mean this script is what put it there.
+    if [[ -n "$_cr_gid" && "$_gid" == "$_cr_gid" ]] \
+       || ! getent group "$_gid" >/dev/null 2>&1; then
+        sudo chgrp video "$_v" 2>/dev/null && _restored=$((_restored + 1)) || true
+    fi
+done
+if (( _restored > 0 )); then
+    echo "  ✓ Raw nodes back to the 'video' group ($_restored restored)"
+else
+    echo "  ✓ Raw nodes already at their default ownership"
 fi
 
 # [1/8] Stop and remove camera relay
@@ -28,6 +85,8 @@ pkill -f "camera-relay start" 2>/dev/null || true
 # Remove binaries and config
 sudo rm -f /usr/local/bin/camera-relay
 sudo rm -f /usr/local/bin/camera-relay-monitor
+sudo rm -f /usr/local/bin/camera-relay-gst
+sudo rm -rf /var/cache/camera-relay
 sudo rm -f /etc/modprobe.d/99-camera-relay-loopback.conf
 sudo rm -f /etc/modules-load.d/v4l2loopback.conf
 # Restore the Intel OEM v4l2-relayd stack if install.sh neutralized it (issue #54)
@@ -115,15 +174,61 @@ fi
 
 # [4/8] Remove udev rules
 echo "[4/8] Removing udev rules..."
+# The MC-node rule is already gone — step 0 removes it before the launcher, so
+# the nodes are never group-owned without something able to open them.
 sudo rm -f /etc/udev/rules.d/90-hide-ipu6-v4l2.rules
 sudo rm -f /etc/udev/rules.d/70-camera-relay-capabilities.rules
+sudo rm -f /usr/local/lib/udev/camera-relay-v4l2-io-mc
+sudo rm -f /usr/local/lib/sysusers.d/camera-relay.conf
 sudo udevadm control --reload-rules 2>/dev/null || true
+sudo udevadm trigger --action=change --subsystem-match=video4linux 2>/dev/null || true
+# Only drop the group once nothing references it. Deleting it while a device
+# node still carries its GID is what leaves the dangling numeric owner that
+# step 0 exists to prevent.
+if getent group camera-relay >/dev/null 2>&1; then
+    _cr_gid=$(getent group camera-relay | cut -d: -f3)
+    _still=0
+    for _v in /dev/video*; do
+        [[ -e "$_v" ]] || continue
+        [[ "$(stat -c%g "$_v" 2>/dev/null)" == "$_cr_gid" ]] && _still=$((_still + 1)) || true
+    done
+    if (( _still > 0 )); then
+        echo "  ⚠ $_still device node(s) still owned by 'camera-relay' — keeping the"
+        echo "    group so their owner keeps resolving. Reboot and re-run to clear it."
+    else
+        sudo groupdel camera-relay 2>/dev/null || true
+    fi
+fi
 echo "  ✓ Udev rules removed"
+
+# Take the Chromium PipeWire camera flag back out. Left behind it would point
+# those browsers at a PipeWire camera that no longer exists.
+# Prefer the installed copy: an uninstall may well be run from a freshly
+# re-downloaded tarball, but it may equally be run from a stale checkout that
+# predates this script.
+_UNINST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_FLAG_TOOL=""
+if [[ -x /usr/local/bin/chromium-pipewire-camera ]]; then
+    _FLAG_TOOL=/usr/local/bin/chromium-pipewire-camera
+elif [[ -x "$_UNINST_DIR/../camera-relay/chromium-pipewire-camera.sh" ]]; then
+    _FLAG_TOOL="$_UNINST_DIR/../camera-relay/chromium-pipewire-camera.sh"
+fi
+if [[ -n "$_FLAG_TOOL" ]]; then
+    echo "  Reverting Chromium browser camera flag..."
+    # The running-browser guard skips any profile whose browser is open, so say
+    # what to do about that rather than leaving the flag silently behind.
+    "$_FLAG_TOOL" disable || true
+    echo "    (a browser that was open kept the flag — quit it and set"
+    echo "     chrome://flags/#enable-webrtc-pipewire-camera back to Default)"
+fi
+sudo rm -f /usr/local/bin/chromium-pipewire-camera
 
 # [5/8] Remove WirePlumber rules
 echo "[5/8] Removing WirePlumber rules..."
 sudo rm -f /etc/wireplumber/main.lua.d/51-disable-ipu6-v4l2.lua
 sudo rm -f /etc/wireplumber/wireplumber.conf.d/50-disable-ipu6-v4l2.conf
+sudo rm -f /etc/wireplumber/main.lua.d/52-disable-libcamera-node.lua
+sudo rm -f /etc/wireplumber/wireplumber.conf.d/52-disable-libcamera-node.conf
 # Restore backed-up SPA plugin if present
 SPA_BAK=$(find /usr/lib -name "libspa-libcamera.so.bak" -path "*/spa-0.2/libcamera/*" 2>/dev/null | head -1)
 if [[ -n "$SPA_BAK" ]]; then
@@ -155,8 +260,51 @@ echo "  ✓ Environment configuration removed"
 
 # [8/8] Restart PipeWire
 echo "[8/8] Restarting PipeWire..."
-systemctl --user restart pipewire wireplumber 2>/dev/null || true
-echo "  ✓ PipeWire restarted"
+
+# Every application holding a stream loses it, and most do not reconnect. Losing
+# your speakers to a *camera* uninstaller points nowhere near its cause — during
+# #80 testing this read as "the uninstall broke my audio" and took a
+# speaker-test to rule out. (issue #81)
+#
+# Weaker case for restarting here than in install.sh: the documented flow is
+# `./uninstall.sh && sudo reboot`, which does this anyway. So default to not
+# interrupting.
+pipewire_stream_apps() {
+    command -v pactl &>/dev/null || return 1
+    # One type per call. `pactl list sink-inputs source-outputs` exits 0 and
+    # prints NOTHING — it takes a single type and silently ignores the rest — so
+    # the combined form looks like "no streams are active" on every machine.
+    { pactl list sink-inputs 2>/dev/null
+      pactl list source-outputs 2>/dev/null
+    } | sed -n 's/^[[:space:]]*application\.name = "\(.*\)"/\1/p' | sort -u
+}
+
+_RESTART=true
+if [[ "$NO_RESTART" == true ]]; then
+    echo "  – Skipped (--no-restart). Reboot to finish."
+    _RESTART=false
+else
+    _IN_USE=$(pipewire_stream_apps || true)
+    if [[ -n "$_IN_USE" ]]; then
+        echo "  ⚠ A PipeWire restart drops the streams these apps hold, and most"
+        echo "    will not reconnect on their own:"
+        sed 's/^/      /' <<< "$_IN_USE"
+        echo ""
+        echo "    Skipping is safe — the reboot this uninstaller recommends does it."
+        # `|| _ans=""` because this script runs under `set -e` and read returns 1
+        # on EOF, which would otherwise kill the uninstall for a piped stdin.
+        read -rp "  Restart PipeWire now and interrupt them? [y/N] " _ans || _ans=""
+        case "$_ans" in
+            [yY]|[yY][eE][sS]) ;;
+            *) echo "  – Skipped. Reboot to finish."; _RESTART=false ;;
+        esac
+    fi
+fi
+
+if [[ "$_RESTART" == true ]]; then
+    systemctl --user restart pipewire wireplumber 2>/dev/null || true
+    echo "  ✓ PipeWire restarted"
+fi
 
 echo ""
 echo "=============================================="

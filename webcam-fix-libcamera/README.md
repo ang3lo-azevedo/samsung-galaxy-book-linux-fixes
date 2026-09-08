@@ -144,22 +144,38 @@ The webcam works correctly with: **Firefox**, **Chrome/Chromium/Brave**, **Zoom*
 
 ### Browser & App Compatibility
 
-With `exclusive_caps=0` (the default), browsers work best using V4L2 directly through the camera relay, without PipeWire camera flags:
+Apps split into two groups, and which group a browser lands in is not a matter of
+configuration — see [Chromium can't use the V4L2 relay](#chromium-cant-use-the-v4l2-relay) below.
 
 | App | Status | Notes |
 |-----|--------|-------|
-| **Firefox** | Working | Works via PipeWire (no flags needed) |
-| **Chrome** | Working | Works via V4L2 camera relay. PipeWire flag optional but can cause issues. |
+| **Firefox** | Working | Reads the V4L2 relay directly on Ubuntu — no flags. On Fedora the PipeWire pref is required ([#37](https://github.com/Andycodeman/samsung-galaxy-book-linux-fixes/issues/37)) |
+| **Chrome** | Working | **Only** via PipeWire — the installer enables the flag for you |
 | **Chromium** | Working | Same as Chrome |
 | **Brave** | Working | Same as Chrome |
-| **Edge** | Working | Works via V4L2 camera relay only. No PipeWire support. |
+| **Edge** | Works, but not automatically | Same V4L2 filter as Chrome. `edge://flags` does not expose the entry, so the installer cannot set it — launch with `--enable-features=WebRtcPipeWireCamera` instead |
 | **Zoom** | Working | Uses V4L2 camera relay |
 | **OBS Studio** | Working | Uses V4L2 camera relay |
 | **VLC** | Working | Uses V4L2 camera relay |
 | **Cheese** | Crashes | Use standalone fix: `cd ../camera-relay && ./cheese-fix.sh` |
 | **GNOME Camera** | May crash | Workaround: `LIBGL_ALWAYS_SOFTWARE=1 snapshot` |
 
-**Note:** The PipeWire camera flag (`chrome://flags/#enable-webrtc-pipewire-camera`) is **not recommended** — community testing found it can prevent Chromium browsers from seeing the camera, and Edge doesn't support it at all. Browsers work reliably through the V4L2 camera relay without this flag.
+**`chrome://flags/#enable-webrtc-pipewire-camera` is required for Chromium-family
+browsers, not optional** — with one version-specific exception. Check with
+`pkg-config --modversion libcamera`:
+
+- **libcamera 0.7+: enable it.** This is what the installer does automatically,
+  and what `chromium-pipewire-camera` does on demand.
+- **libcamera 0.2.0 (Ubuntu 24.04 Noble / Zorin): leave it Disabled.** That
+  libcamera has no IPU6 support, so the flag sends Chrome down a path that
+  produces no frames either. Neither setting gives you a camera there; fix the
+  libcamera version instead.
+
+Electron apps (Slack, Teams, Discord, VS Code) use the same Chromium capture
+code and are filtered out the same way, but **the command-line switch does not
+rescue them** — PipeWire *camera* support is not wired into Electron at all. See
+[Chromium can't use the V4L2 relay](#chromium-cant-use-the-v4l2-relay) for the
+detail, and for Edge, which the switch *does* fix.
 
 Quick test:
 
@@ -181,12 +197,16 @@ The install script creates these files:
 |------|---------|
 | `/etc/modules-load.d/ivsc.conf` | IVSC module auto-loading at boot |
 | `/etc/modprobe.d/ivsc-camera.conf` | Softdep: IVSC loads before sensor |
-| `/etc/udev/rules.d/90-hide-ipu6-v4l2.rules` | Remove uaccess from raw IPU6 V4L2 nodes |
+| `/etc/udev/rules.d/74-camera-relay-mc-nodes.rules` | Move MC-centric V4L2 nodes to the `camera-relay` group, strip their session ACL, and stop them advertising as cameras (the `74-` prefix is load-bearing — see the comment in the file) |
+| `/usr/local/lib/udev/camera-relay-v4l2-io-mc` | udev helper: reports `V4L2_CAP_IO_MC` for a node |
+| `/usr/local/lib/sysusers.d/camera-relay.conf` | Declares the memberless `camera-relay` group |
 | `/etc/wireplumber/wireplumber.conf.d/50-disable-ipu6-v4l2.conf` | Hide raw IPU6 nodes from PipeWire (WP 0.5+) |
 | `/etc/wireplumber/main.lua.d/51-disable-ipu6-v4l2.lua` | Hide raw IPU6 nodes from PipeWire (WP 0.4) |
 | `/usr/share/libcamera/ipa/simple/ov02c10.yaml` | Sensor color tuning with CCM |
 | `/usr/local/bin/camera-relay` | On-demand camera relay CLI tool |
 | `/usr/local/bin/camera-relay-monitor` | V4L2 event monitor for on-demand activation |
+| `/usr/local/bin/camera-relay-gst` | setgid launcher: the only thing that can open the raw camera nodes |
+| `/var/cache/camera-relay/` | GStreamer/Mesa caches for the pipeline (root-owned, group-writable) |
 | `/etc/modules-load.d/v4l2loopback.conf` | Load v4l2loopback module at boot |
 | `/etc/modprobe.d/99-camera-relay-loopback.conf` | v4l2loopback config for camera relay |
 | `/usr/local/share/camera-relay/camera-relay-systray.py` | System tray GUI |
@@ -260,15 +280,112 @@ grep -i vsc /lib/modules/$(uname -r)/modules.builtin
 
 ### "external clock 26000000 is not supported" in dmesg
 
-Some Galaxy Book3/Book4 Ultra models (Raptor Lake) have a 26 MHz external clock instead of the expected 19.2 MHz. The installer detects this automatically and offers to install the [DKMS-patched ov02c10 driver](../ov02c10-26mhz-fix/). If you skipped the prompt during install, run the fix manually:
+Some Galaxy Book3/Book4 models have a 26 MHz external clock instead of the expected 19.2 MHz. This is a **per-board property, not a platform one** — it is confirmed on both Raptor Lake and Meteor Lake IPU6, including the Book4 Ultra `NP960XGL-XG1BR` (Meteor Lake, `8086:7d19`). It is not model-determined either: a different `960XGL` board, same model and same Meteor Lake IPU6, runs the stock driver with no clock error and does not need the fix. Don't rule it in or out from your platform or your model number; go by the dmesg error. The installer detects it automatically and offers to install the [DKMS-patched ov02c10 driver](../ov02c10-26mhz-fix/). If you skipped the prompt during install, run the fix manually:
 
 ```bash
 cd ov02c10-26mhz-fix && sudo ./install.sh
 ```
 
+### "Additional Drivers" offers `intel-ipu6-dkms` — don't install it
+
+Ubuntu's **Additional Drivers** panel (`software-properties-gtk`) lists the IPU
+as *"Intel Corporation: Meteor Lake IPU — This device is not working"* and
+offers *"Using Intel Integrated Image Processing Unit 6 (IPU6) driver from
+intel-ipu6-dkms (open source)"*. Leave it on **"Do not use the device"**.
+
+The "not working" label is a false positive. `ubuntu-drivers` matches hardware
+by modalias, and the only modalias `intel-ipu6-dkms` declares is for
+`intel-ipu6-psys` — the PSYS function, which the mainline driver does not
+expose. No installed package claims that modalias, so the panel reports the
+device as unclaimed even while the in-tree driver is bound and streaming:
+
+```bash
+lspci -nnk -d 8086:7d19    # Meteor Lake; use 8086:a75d on Raptor Lake
+```
+
+That prints `Kernel driver in use: intel-ipu6` on a working system.
+
+Installing the offered driver can break the camera. `intel-ipu6-dkms` is the
+out-of-tree Intel stack ([`intel/ipu6-drivers`](https://github.com/intel/ipu6-drivers),
+what the legacy [`webcam-fix/`](../webcam-fix/) is built around), and its
+`dkms.conf` builds **`ov02c10` unconditionally** into `/updates` — the same
+module name and the same directory as the [26 MHz fix](../ov02c10-26mhz-fix/).
+Intel's copy does not carry the 26 MHz patch, so on an affected board the camera
+goes back to `external clock 26000000 is not supported`.
+
+There is nothing to gain in exchange. On any kernel 6.10 or newer, `intel-ipu6`
+and `intel-ipu6-isys` are not built at all (the `dkms.conf` gates them on older
+kernels, because the in-tree drivers took over). What remains is
+`intel-ipu6-psys`, which is only useful to the proprietary camera HAL — the
+[legacy stack](../webcam-fix/) this fix replaces. That HAL is not in the Ubuntu
+archive on any release: `libcamhal-ipu6epmtl` and `gstreamer1.0-icamera` are
+published only in the `ppa:oem-solutions-group/intel-ipu6` OEM PPA, which is not
+enabled on a stock install. So out of the box `intel-ipu6-psys` has nothing to
+feed — and if you *do* enable that PPA, you are setting up the legacy stack
+deliberately, which is a different decision from repairing this one.
+
+### Camera stopped working after installing `intel-ipu6-dkms`
+
+**Symptom.** The camera worked, you accepted the Additional Drivers offer above,
+and now `camera-relay status` fails or dmesg is back to
+`external clock 26000000 is not supported`.
+
+Check which `ov02c10` the kernel resolves, and who owns it:
+
+```bash
+modinfo -n ov02c10
+dkms status | grep -E 'ov02c10|ipu6'
+```
+
+Remove the Intel stack, then re-run the 26 MHz installer to rebuild and
+reinstate the patched driver:
+
+```bash
+sudo apt purge intel-ipu6-dkms
+cd ov02c10-26mhz-fix && sudo ./install.sh
+```
+
+Don't reach for `dkms install ov02c10/1.0` directly. Purging the Intel package
+clears *its* DKMS state, not ours — the `ov02c10/1.0` "installed" marker for the
+running kernel survives, and DKMS checks that marker first, so the command exits
+with *"This module/version combo is already installed for kernel …"* and changes
+nothing. [`install.sh`](../ov02c10-26mhz-fix/install.sh) does the full
+`dkms remove --all` → `add` → `build` → `install` cycle, re-signs the module for
+Secure Boot, and refreshes `depmod` and the initramfs (with `dracut` /
+`mkinitcpio` fallbacks off Ubuntu).
+
+Reboot, then verify:
+
+```bash
+modinfo -n ov02c10                 # must be under updates/dkms
+modinfo ov02c10 | grep -i '^sig'   # no output = unsigned
+journalctl -k -b -g '26000000Hz clock'
+```
+
+A path under `kernel/drivers` means the DKMS build or install failed. The right
+path with no `sig*` fields means the module was built but is unsigned, so under
+Secure Boot it is rejected at load time and the in-tree driver wins — which
+rejects 26 MHz too. `modinfo -n` reads the path out of `modules.dep` and cannot
+see that rejection, which is why the signature needs its own check. See
+[Secure Boot](../ov02c10-26mhz-fix/README.md#secure-boot) in the 26 MHz fix.
+
 ### Too many "ipu6" entries in camera list
 
-Log out and back in for the udev rules and WirePlumber config to take effect. The rules hide raw IPU6 V4L2 nodes so only the libcamera source and Camera Relay appear.
+Log out and back in for the udev rules and WirePlumber config to take effect, then check with:
+
+```bash
+camera-relay doctor
+```
+
+The `MC nodes` line reports whether any raw node is still reachable from your session — those are exactly the ones that show up as spurious "ipu6" cameras.
+
+The ISYS driver registers one capture node per possible stream (48 on a Book4), and the kernel marks each `V4L2_CAP_IO_MC`: usable only after userspace configures the media graph, never as a standalone camera. Nothing carries that bit into udev, so they all claim to be cameras. The installer therefore moves them into a memberless `camera-relay` group and clears the bogus properties, which covers both kinds of application — the ones that enumerate through udev (Chromium and friends) and the ones that walk `/dev/video*` calling `QUERYCAP` and only skip what they cannot open (Firefox, Zoom, OBS).
+
+One consequence: `cam` and `qcam` can no longer open the camera as your user. Run them through the launcher, which holds the group:
+
+```bash
+camera-relay-gst --list-cameras
+```
 
 ### Zoom / OBS / VLC don't see the camera
 
@@ -278,24 +395,167 @@ Enable the on-demand camera relay:
 camera-relay enable-persistent
 ```
 
-### Chromium browser doesn't show camera
+### Firefox: `NotAllowedError` on every camera request (stale portal permission)
 
-Chrome/Chromium/Brave/Edge see the camera through the **V4L2 camera relay**, not PipeWire. Make sure the relay is running:
+Only affects you if you've set `media.webrtc.camera.allow-pipewire = true` in `about:config`.
+Firefox then fails on *every* camera request with `NotAllowedError`, while other apps (Chrome, OBS)
+work fine.
 
-```bash
-camera-relay status
-camera-relay enable-persistent --yes  # if not enabled
-```
-
-**Keep `chrome://flags/#enable-webrtc-pipewire-camera` DISABLED.** On Ubuntu/Zorin (Noble) the PipeWire camera path goes through the system libcamera 0.2.0, which has no IPU6 support — enabling the flag makes Chrome use that broken path and bypass the working V4L2 relay entirely (the camera will *not* be found).
-
-If Chrome shows "camera not found" even with the relay streaming and the flag off: Chromium enumerates V4L2 cameras through **udev** and only lists devices whose `ID_V4L_CAPABILITIES` property contains `:capture:`. `v4l_id` tags the loopback once at device creation — before any capture format is negotiated — so the property can come up without `:capture:` and Chrome silently filters the device out (libcamera/PipeWire apps like Cheese and Firefox are unaffected, which is why they still work). The installer ships a udev rule (`/etc/udev/rules.d/70-camera-relay-capabilities.rules`) that forces the capture capability for the relay node. Check it with:
+Cause: a stale **"denied"** entry for Firefox in the xdg-desktop-portal permission store, left
+behind when the portal crashed mid-negotiation (e.g. the glib2 `g_weak_ref_get` race in
+xdg-desktop-portal 1.21.0 on Fedora 44). The denial persists and silently blocks every later
+request, even once the portal itself is fixed.
 
 ```bash
-udevadm info /dev/videoN | grep -i ID_V4L_CAPABILITIES   # the "Camera Relay" node
+# Check — look for "org.mozilla.firefox" 1 "no"
+busctl call --user org.freedesktop.impl.portal.PermissionStore \
+  /org/freedesktop/impl/portal/PermissionStore \
+  org.freedesktop.impl.portal.PermissionStore \
+  Lookup ss "devices" "camera"
+
+# Fix, then restart Firefox
+busctl call --user org.freedesktop.impl.portal.PermissionStore \
+  /org/freedesktop/impl/portal/PermissionStore \
+  org.freedesktop.impl.portal.PermissionStore \
+  DeletePermission sss "devices" "camera" "org.mozilla.firefox"
 ```
 
-After installing, **fully quit Chrome** (`pkill -9 -f chrome` — Chrome caches its device list and keeps a background process) before relaunching.
+Turning the pref back off is **not** a general way around this, and the earlier revision of
+this section that suggested it was wrong. On Book4 under Ubuntu, Firefox does fall back to
+reading the relay node directly and needs no flag. On Fedora 44 the reporter measured the
+opposite and it is worth quoting exactly:
+
+| `media.webrtc.camera.allow-pipewire` | Result |
+| --- | --- |
+| `true` | both **Camera Relay** and **Built-in Front Camera** work |
+| `false` | no camera works — `NotReadableError: Starting videoinput failed` |
+
+So on Fedora: delete the stale PermissionStore entry and leave the pref **on**. Do not trade a
+stale denial for a camera that cannot start at all. Thanks to
+[@david-bartlett](https://github.com/david-bartlett) ([#37](https://github.com/Andycodeman/samsung-galaxy-book-linux-fixes/issues/37)).
+
+### Chromium can't use the V4L2 relay
+
+Chrome, Chromium, Brave, Edge and every Electron app filter the camera relay out
+of their device list before you ever see a permission prompt —
+`navigator.mediaDevices.enumerateDevices()` simply returns no `videoinput`.
+
+This is not a permission, sandbox or relay problem. Chromium's V4L2 enumeration
+([`video_capture_device_factory_v4l2.cc`](https://chromium.googlesource.com/chromium/src/+/refs/heads/main/media/capture/video/linux/video_capture_device_factory_v4l2.cc))
+accepts a node only when it reports capture and **not** output:
+
+```c
+(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE &&
+ !(cap.capabilities & V4L2_CAP_VIDEO_OUTPUT)) ||
+(cap.capabilities & V4L2_CAP_DEVICE_CAPS &&
+ cap.device_caps & V4L2_CAP_VIDEO_CAPTURE &&
+ !(cap.device_caps & V4L2_CAP_VIDEO_OUTPUT))
+```
+
+The relay is created with `exclusive_caps=0`, so it advertises both and every
+branch fails:
+
+```bash
+v4l2-ctl -d /dev/videoN --info    # Device Caps: Video Capture AND Video Output
+```
+
+Firefox accepts dual caps and reads the node directly, which is exactly why
+Firefox works out of the box and Chrome shows nothing.
+
+**The fix** is to route those browsers through PipeWire, where WirePlumber
+publishes the relay as an ordinary camera source. The installer does this, and
+you can run it any time:
+
+```bash
+chromium-pipewire-camera          # installed to /usr/local/bin by the installer
+```
+
+You will usually need to, because it skips any profile whose browser is open —
+which it normally is during an install. (From an unpacked source tree the same
+script is `camera-relay/chromium-pipewire-camera.sh`.)
+
+It edits each browser's `Local State` to enable
+`chrome://flags/#enable-webrtc-pipewire-camera` (backing the file up first), or
+you can set that flag by hand. Either way the browser must be **fully quit**
+first — Chromium rewrites `Local State` from memory on exit and would discard the
+change — and restarted afterwards, since it caches its device list at startup.
+
+`camera-relay doctor` reports all of this: the node's actual capabilities, whether
+PipeWire publishes a camera source, and whether the flag is set per browser.
+
+#### The second half: WirePlumber's stale format list
+
+The flag alone is not enough, because a second timing bug sits behind it.
+
+`v4l2loopback` is loaded at boot with no producer attached, so it advertises a
+generic catch-all format set — `BGRx`/`xRGB` at any size from 2x1 to 8192x8192,
+expressed as a `Choice:Range`. The relay's monitor only pins `YUYV 1920x1080`
+when it starts at login, and `camera-relay.service` is ordered
+`After=wireplumber.service` — so WirePlumber has already probed the unconfigured
+device, cached that generic list, and will never look again.
+
+Firefox never notices, because it reads `/dev/video0` directly. WebRTC's PipeWire
+camera path needs a *discrete* rectangle out of `SPA_PARAM_EnumFormat`; a range
+yields no usable resolution, so the camera arrives with zero capabilities. Chrome
+logs the camera and then offers no device — indistinguishable from no camera:
+
+```
+camera_portal.cc:215]    Camera access granted by the XDG portal.
+pipewire_session.cc:99]  Found Camera: Camera Relay (V4L2)
+```
+```js
+await navigator.mediaDevices.getUserMedia({video:true})
+// NotFoundError: Requested device not found
+```
+
+Compare the two views to spot it:
+
+```bash
+v4l2-ctl -d /dev/videoN --list-formats-ext   # what the device really offers
+pw-cli enum-params <node-id> EnumFormat      # what PipeWire thinks it offers
+```
+
+There is no lighter re-probe available — the V4L2 monitor is udev-driven, nodes
+are built at discovery, and WirePlumber exposes no "re-probe this device" call.
+Restarting it is the documented answer; see *"`device.capabilities` is read-only
+in PipeWire"* in [the legacy fix](../webcam-fix/README.md#step-9-fix-pipewire-device-classification),
+which hit the same class of bug.
+
+The relay handles this itself, from `ExecStartPost`: it waits for the monitor to
+pin the format, compares it against what PipeWire advertises, and restarts
+WirePlumber **only** when they disagree — so restarting the relay by hand costs
+no audio glitch when things are already correct. Run it manually with:
+
+```bash
+camera-relay nudge-wireplumber
+```
+
+Two things this does **not** fix:
+
+- **Edge** does not expose the entry in `edge://flags`, so there is nothing for
+  the installer to write into its profile. The underlying Chromium feature is
+  still compiled in, so the command-line switch works — edit the `Exec=` line of
+  `microsoft-edge.desktop`, or launch it as:
+
+  ```bash
+  microsoft-edge --enable-features=WebRtcPipeWireCamera
+  ```
+
+- **Electron apps** (Slack, Discord, Teams, VS Code) are a different case: they
+  hit the same V4L2 filter, but the switch does **not** help, because PipeWire
+  *camera* support is not wired into Electron — only the screen-share capturer
+  is ([electron#45058](https://github.com/electron/electron/issues/45058) is a
+  closed, unimplemented request). Nothing in this repo fixes them today.
+- **libcamera 0.2.0** (Ubuntu 24.04 Noble / Zorin) has no IPU6 support, so the
+  PipeWire path produces no frames either. The script refuses to enable the flag
+  below 0.7 for that reason.
+
+> **Why not `exclusive_caps=1`?** It would make the node advertise capture only
+> and fix every Chromium app at once, with no flag. The relay deliberately moved
+> away from it: with `exclusive_caps=1` WirePlumber classifies the node as an
+> output at boot, before the relay attaches, and the PipeWire path breaks instead
+> — trading one broken set of apps for another. See the note above
+> `nudge_wireplumber` in `camera-relay/camera-relay`.
 
 ### Black screen in apps / "v4l2loopback ... não é um dispositivo de saída"
 
@@ -323,6 +583,105 @@ disables and masks `v4l2-relayd.service` and moves the OEM
 `/etc/modprobe.d/v4l2loopback.conf` aside (restored by `uninstall.sh`). Just
 re-run `sudo bash install.sh` and reboot. The change is fully reversible:
 `uninstall.sh` restores the OEM file and re-enables the service.
+
+The kernel-side half of the same OEM stack is `intel-ipu6-dkms`, which Ubuntu's
+Additional Drivers panel offers on these machines — see
+["Additional Drivers" offers `intel-ipu6-dkms`](#additional-drivers-offers-intel-ipu6-dkms--dont-install-it)
+above. Don't install it.
+
+### LED on but black image, on laptops with a dedicated GPU
+
+**Symptom.** The webcam privacy LED lights up, `camera-relay status` reports
+`STREAMING`, and apps still get a black picture — Google Meet says *"Your camera
+may be blocked"*. Affects hybrid-GPU laptops (Intel or AMD iGPU + NVIDIA dGPU)
+— the Galaxy Book4 Ultra and the RTX variants of the Book5 Pro ship in this
+configuration.
+
+Having the dGPU is not by itself enough: what matters is whether the **NVIDIA
+kernel driver is bound to it**. If nothing is bound — no `nvidia`/`nouveau`
+module loaded, no `/dev/dri/renderD*` node for it — then NVIDIA's EGL driver
+cannot claim a device, GLVND falls through to Mesa, and you are not affected
+even on a machine that has the hardware. Check with:
+
+```bash
+ls /dev/dri/renderD*      # two nodes = hybrid and affected; one = not
+camera-relay doctor       # the "GPU / EGL debayer" section reports the topology
+```
+
+**Cause.** libcamera's Software ISP converts Bayer→RGB on the GPU through EGL.
+Which GPU that is comes from GLVND, which loads the vendor ICDs in
+`/usr/share/glvnd/egl_vendor.d` in filename order — and NVIDIA's ships as
+`10_nvidia.json`, ahead of Mesa's `50_mesa.json`. The debayer therefore runs on
+NVIDIA's proprietary EGL driver, which it is not compatible with:
+
+```
+ERROR eGL egl.cpp:134 glFrameBufferTexture2D error 36054
+ERROR Debayer debayer_egl.cpp:639 debayerGPU failed
+```
+
+The sensor powers up — hence the LED — but every frame dies in the conversion
+and nothing ever reaches v4l2loopback.
+
+**Why it is so easy to misdiagnose.** Run `cam` from a terminal and it usually
+works: a desktop session normally has EGL already resolved to Mesa. The failure
+only appears inside the systemd user service, which inherits none of that.
+
+Confirm it directly:
+
+```bash
+__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json cam -c 1 -C5
+```
+
+That should report a Mesa renderer and ~30 fps. Swapping `50_mesa.json` for
+`10_nvidia.json` hangs and dies at the timeout without a single frame.
+
+**Fix.** Handled automatically — `camera-relay enable-persistent` detects the
+hybrid setup and bakes the pin into `camera-relay.service`:
+
+```
+Environment=__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
+```
+
+If you are on an install from before this landed, re-run the installer, or just
+regenerate the unit:
+
+```bash
+camera-relay disable-persistent && camera-relay enable-persistent
+```
+
+`camera-relay doctor` now prints a **GPU / EGL debayer** section that lists the
+render nodes and their drivers, the vendor ICDs in GLVND's load order, the pin
+actually in effect, and any `debayerGPU failed` lines from the pipeline log.
+
+To apply it by hand instead — e.g. to a unit you maintain yourself — drop in:
+
+```bash
+mkdir -p ~/.config/systemd/user/camera-relay.service.d
+printf '[Service]\nEnvironment=__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json\n' \
+  > ~/.config/systemd/user/camera-relay.service.d/10-force-intel-gpu.conf
+systemctl --user daemon-reload && systemctl --user restart camera-relay.service
+```
+
+Do **not** put `__EGL_VENDOR_LIBRARY_FILENAMES` in `/etc/environment.d`: unlike
+`LIBCAMERA_SOFTISP_MODE` it steers every GL client on the machine, so a global
+setting would take NVIDIA offload away from games and everything else.
+
+**Known gap.** The pin covers the camera-relay path. Apps that read the camera
+through **PipeWire's libcamera source** directly (Chromium with
+`#enable-webrtc-pipewire-camera`) run the debayer inside `pipewire.service`,
+which has no pin, so they can still hit this. Workaround — same drop-in, on
+PipeWire:
+
+```bash
+mkdir -p ~/.config/systemd/user/pipewire.service.d
+printf '[Service]\nEnvironment=__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json\n' \
+  > ~/.config/systemd/user/pipewire.service.d/10-force-intel-gpu.conf
+systemctl --user daemon-reload && systemctl --user restart pipewire.service
+```
+
+The slower but unconditionally safe alternative for that path is CPU debayer
+(`LIBCAMERA_SOFTISP_MODE=cpu`), which the installer already sets globally when
+NVIDIA is the *active* renderer.
 
 ### Desaturated, green-tinted or purple image (colour tuning)
 

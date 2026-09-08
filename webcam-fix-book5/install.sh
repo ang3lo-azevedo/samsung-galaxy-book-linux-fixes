@@ -689,6 +689,107 @@ EOF
 fi
 echo "  ✓ Created /etc/profile.d/libcamera-ipa.sh"
 
+# Book5 Pro ships in RTX dGPU configurations, so it runs the same hybrid-GPU
+# stack as the Book4 Ultra and hits the same EGL bug: GLVND loads the vendor ICDs
+# in /usr/share/glvnd/egl_vendor.d in filename order, NVIDIA's ships as
+# 10_nvidia.json ahead of Mesa's 50_mesa.json, and libcamera's Software ISP then
+# runs its EGL debayer on NVIDIA's proprietary driver, which it cannot use:
+#     ERROR eGL egl.cpp:134 glFrameBufferTexture2D error 36054
+#     ERROR Debayer debayer_egl.cpp:639 debayerGPU failed
+# The sensor still powers up (privacy LED on, relay says STREAMING) but not one
+# frame reaches v4l2loopback, so apps show a black picture. Same failure the
+# LIBCAMERA_SOFTISP_MODE=cpu block below was written for (#15, #50, #70), but
+# pinning the iGPU fixes it without giving up the framerate (#66). It only bites
+# under systemd — a desktop session normally has EGL already resolved to Mesa,
+# so `cam` from a terminal works and the bug looks like it isn't there.
+#
+# camera-relay bakes the pin into its own service unit (see detect_egl_vendor_pin
+# in ../camera-relay/camera-relay); detect the same thing here so the state is
+# visible at install time. Deliberately NOT written to /etc/environment.d like
+# LIBCAMERA_SOFTISP_MODE below: __EGL_VENDOR_LIBRARY_FILENAMES steers *every* GL
+# client on the system, so setting it globally would take NVIDIA offload away
+# from games and everything else. It belongs on the camera units only.
+# Keep this block in sync with webcam-fix-libcamera/install.sh.
+HYBRID_EGL_VENDOR=""
+HYBRID_GPU=false
+_nv_node=false
+_mesa_node=false
+_render_nodes=0
+for _node in /dev/dri/renderD*; do
+    [[ -e "$_node" ]] || continue
+    _render_nodes=$((_render_nodes + 1))
+    _drv=""
+    _link=$(readlink -f "/sys/class/drm/$(basename "$_node")/device/driver" 2>/dev/null) || _link=""
+    [[ -n "$_link" ]] && _drv=$(basename "$_link")
+    case "$_drv" in
+        nvidia|nvidia-drm) _nv_node=true ;;
+        "")                ;;
+        *)                 _mesa_node=true ;;
+    esac
+done
+if $_nv_node && $_mesa_node && [[ "$_render_nodes" -ge 2 ]]; then
+    HYBRID_GPU=true
+    # Derive the vendor ICD from the iGPU that is actually present rather than
+    # hardcoding 50_mesa.json: every non-NVIDIA render node here (i915, xe,
+    # amdgpu, radeon) is driven by Mesa's EGL, so the file to pin is whichever
+    # ICD dispatches to libEGL_mesa — whatever the distro numbered it.
+    for _dir in /etc/glvnd/egl_vendor.d /usr/share/glvnd/egl_vendor.d; do
+        [[ -d "$_dir" ]] || continue
+        for _f in "$_dir"/*.json; do
+            [[ -f "$_f" ]] || continue
+            if grep -q 'libEGL_mesa' "$_f" 2>/dev/null; then
+                HYBRID_EGL_VENDOR="$_f"
+                break 2
+            fi
+        done
+    done
+fi
+if [[ -n "$HYBRID_EGL_VENDOR" ]]; then
+    echo "  ✓ Hybrid GPU (iGPU + NVIDIA) — camera-relay.service will pin EGL to"
+    echo "    $HYBRID_EGL_VENDOR (keeps the GPU debayer off the NVIDIA driver)"
+elif $HYBRID_GPU; then
+    echo "  ⚠ Hybrid GPU detected but no Mesa EGL vendor file found in"
+    echo "    /usr/share/glvnd/egl_vendor.d — if the camera LED lights but apps show"
+    echo "    black, run 'camera-relay doctor' and check the GPU / EGL section"
+fi
+unset _node _link _drv _dir _f _nv_node _mesa_node _render_nodes
+
+# If an NVIDIA GPU is present, libcamera's GPU (EGL) debayer is unreliable
+# (debayer_egl.cpp is incompatible with NVIDIA's proprietary EGL driver, and on
+# hybrid laptops EGL may pick the NVIDIA renderer even when the iGPU is active)
+# and produces black frames. camera-relay pins EGL to the iGPU and, failing that,
+# forces CPU debayer on its own service unit — but the PipeWire-libcamera path
+# (used by apps that pick that source directly) needs a fix too, and only the CPU
+# one is safe to set globally, so set that here. (issues #15, #50, #70)
+# Only force CPU debayer when NVIDIA is the *active EGL renderer* — merely having
+# an NVIDIA card present is not enough. On a hybrid laptop rendering on the Intel
+# iGPU, EGL never touches the NVIDIA driver, so GPU debayer works fine and forcing
+# CPU costs a large chunk of framerate for nothing (issue #66). `prime-select` is
+# Ubuntu-only, so it can't be the sole guard. This mirrors camera-relay's own
+# detection — keep the two in sync.
+NVIDIA_ACTIVE=""
+if command -v glxinfo >/dev/null 2>&1; then
+    # glxinfo is authoritative: it reports the renderer actually in use.
+    if glxinfo 2>/dev/null | grep -qi "opengl renderer.*nvidia"; then
+        NVIDIA_ACTIVE="yes"
+    fi
+elif [[ -d /proc/driver/nvidia ]] || lspci 2>/dev/null | grep -qi 'VGA.*NVIDIA\|3D controller.*NVIDIA'; then
+    # No glxinfo — fall back to presence, unless prime-select puts Intel in charge.
+    if ! { command -v prime-select >/dev/null 2>&1 && [[ "$(prime-select query 2>/dev/null)" == "intel" ]]; }; then
+        NVIDIA_ACTIVE="maybe"
+    fi
+fi
+if [[ -n "$NVIDIA_ACTIVE" ]]; then
+    sudo mkdir -p /etc/environment.d
+    echo "LIBCAMERA_SOFTISP_MODE=cpu" | \
+        sudo tee /etc/environment.d/10-libcamera-softisp.conf > /dev/null
+    echo "  ✓ NVIDIA is the active renderer — set LIBCAMERA_SOFTISP_MODE=cpu globally (CPU debayer)"
+    [[ "$NVIDIA_ACTIVE" == "maybe" ]] && \
+        echo "    (couldn't confirm via glxinfo — install mesa-utils/glx-utils if your camera framerate is low)"
+else
+    sudo rm -f /etc/environment.d/10-libcamera-softisp.conf
+fi
+
 # ──────────────────────────────────────────────
 # [11/15] Hide raw IPU7 V4L2 nodes from PipeWire
 # ──────────────────────────────────────────────
@@ -807,6 +908,26 @@ SCRIPT_DIR="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 RELAY_DIR="$SCRIPT_DIR/../camera-relay"
 
 if [[ -d "$RELAY_DIR" ]]; then
+    # Install the GStreamer command-line tools first. camera-relay's pipeline IS
+    # gst-launch-1.0, and gst-inspect-1.0 is what the probe below (and the relay
+    # itself) uses to find libcamerasrc. On Debian/Ubuntu they live in
+    # gstreamer1.0-tools, which gstreamer1.0-libcamera does NOT depend on, so a
+    # desktop install can easily lack them. Without this the probe below exits
+    # 127 and misreads as "libcamerasrc missing" (issue #65).
+    if ! command -v gst-launch-1.0 &>/dev/null || ! command -v gst-inspect-1.0 &>/dev/null; then
+        echo "  Installing GStreamer command-line tools..."
+        if [[ "$DISTRO" == "fedora" ]]; then
+            sudo dnf install -y gstreamer1 2>/dev/null || true
+        elif [[ "$DISTRO" == "arch" ]]; then
+            sudo pacman -S --needed --noconfirm gstreamer 2>/dev/null || true
+        elif [[ "$DISTRO" == "ubuntu" ]]; then
+            sudo apt install -y gstreamer1.0-tools 2>/dev/null || true
+        fi
+        if ! command -v gst-launch-1.0 &>/dev/null; then
+            echo "  ⚠ gst-launch-1.0 still unavailable — camera-relay cannot run without it."
+        fi
+    fi
+
     # Install GStreamer libcamerasrc element if not present
     if ! gst-inspect-1.0 libcamerasrc &>/dev/null 2>&1; then
         echo "  Installing GStreamer libcamera plugin..."
@@ -816,6 +937,9 @@ if [[ -d "$RELAY_DIR" ]]; then
         elif [[ "$DISTRO" == "arch" ]]; then
             sudo pacman -S --needed --noconfirm gst-plugin-libcamera 2>/dev/null || true
         elif [[ "$DISTRO" == "ubuntu" ]]; then
+            # libcamerasrc ships in gstreamer1.0-libcamera on Ubuntu/Debian, not
+            # in gstreamer1.0-plugins-bad — try the correct package first.
+            sudo apt install -y gstreamer1.0-libcamera 2>/dev/null || \
             sudo apt install -y gstreamer1.0-plugins-bad 2>/dev/null || true
         fi
     fi
@@ -922,22 +1046,30 @@ if [[ -d "$RELAY_DIR" ]]; then
     echo "v4l2loopback" | sudo tee /etc/modules-load.d/v4l2loopback.conf > /dev/null
     echo "  ✓ Installed v4l2loopback autoload (/etc/modules-load.d/v4l2loopback.conf)"
 
-    # Chromium/Chrome enumerate V4L2 cameras through udev and only list
-    # devices whose ID_V4L_CAPABILITIES udev property contains ":capture:".
-    # v4l_id (60-persistent-v4l.rules) tags the node ONCE at device creation
-    # — while the relay monitor holds the writer fd and no capture format is
-    # negotiated yet — so the property can come up without ":capture:" and
-    # Chrome never lists the camera (even though it streams capture fine, and
-    # libcamera/PipeWire apps like Cheese/Firefox work). Force the capture
-    # capability for the relay node so Chrome enumerates it. (issue #54)
+    # v4l_id (60-persistent-v4l.rules) tags the node ONCE at device creation —
+    # while the relay monitor holds the writer fd and no capture format is
+    # negotiated yet — so ID_V4L_CAPABILITIES can come up without ":capture:"
+    # and udev-based consumers misread the node. Normalise it here.
+    #
+    # This was originally added believing it was what made Chrome list the
+    # camera (issue #54). It is not: Chromium enumerates with base::FileEnumerator
+    # over /dev/video* and opens each node with VIDIOC_QUERYCAP — it never reads
+    # a udev property. Chrome stays blind to the relay with this rule applied and
+    # ID_V4L_CAPABILITIES=":capture:" set, because the node reports VIDEO_OUTPUT
+    # alongside VIDEO_CAPTURE. That is handled by the PipeWire flag below.
+    # The rule is kept because other udev consumers do read the property.
     sudo tee /etc/udev/rules.d/70-camera-relay-capabilities.rules > /dev/null << 'EOF'
-# Force ID_V4L_CAPABILITIES so Chromium/Chrome's udev-based V4L2 camera
-# enumeration lists the Camera Relay loopback. Runs after 60-persistent-v4l.
+# Normalise ID_V4L_CAPABILITIES for the Camera Relay loopback: v4l_id tags the
+# node before any capture format is negotiated, so the property can come up
+# without ":capture:". Runs after 60-persistent-v4l.
+#
+# Note: this does NOT affect Chromium. It enumerates /dev/video* directly and
+# never reads udev properties — see the PipeWire camera flag instead.
 SUBSYSTEM=="video4linux", ATTR{name}=="Camera Relay", ENV{ID_V4L_CAPABILITIES}=":capture:"
 EOF
     sudo udevadm control --reload-rules
     sudo udevadm trigger --action=change --subsystem-match=video4linux
-    echo "  ✓ Installed Camera Relay udev capabilities rule (Chrome/Chromium fix)"
+    echo "  ✓ Installed Camera Relay udev capabilities rule"
 
     # Rebuild initramfs so it picks up the new v4l2loopback config.
     # Without this, v4l2loopback may load from initramfs with stale
@@ -978,10 +1110,49 @@ EOF
         fi
     fi
 
+    # Build and install the pipeline launcher (C binary).
+    #
+    # Not optional: since v0.3.59 the relay does not shell out to gst-launch-1.0
+    # itself, it execs this launcher, and camera-relay `die`s at start when the
+    # binary is absent. This installer never built it, so every Book5 install
+    # after v0.3.59 produced a relay that could not start. (issue #85, reported
+    # by @david-bartlett)
+    #
+    # Installed plain 755 here, NOT setgid. The setgid treatment in
+    # webcam-fix-libcamera exists to reach raw MC nodes that its udev rule moves
+    # into the memberless camera-relay group; this installer ships neither that
+    # group nor that rule, so the nodes stay in 'video' and the desktop user
+    # already has them. camera-relay-gst handles egid == gid explicitly and runs
+    # fine. Porting the full setgid + udev hardening across is issue #70 and
+    # wants a Book5 tester, not a same-day patch.
+    if [[ -f "$RELAY_DIR/camera-relay-gst.c" ]]; then
+        echo "  Building pipeline launcher..."
+        if gcc -O2 -Wall -o /tmp/camera-relay-gst "$RELAY_DIR/camera-relay-gst.c"; then
+            sudo install -m 755 /tmp/camera-relay-gst /usr/local/bin/camera-relay-gst
+            rm -f /tmp/camera-relay-gst
+            echo "  ✓ Installed /usr/local/bin/camera-relay-gst"
+        else
+            echo "  ⚠ Failed to build camera-relay-gst (gcc required) — the relay"
+            echo "    will not start. Install gcc and re-run this script."
+        fi
+    else
+        echo "  ⚠ camera-relay-gst.c not found in $RELAY_DIR — the relay will not start"
+    fi
+
     # Install CLI tool
     sudo cp "$RELAY_DIR/camera-relay" /usr/local/bin/camera-relay
     sudo chmod 755 /usr/local/bin/camera-relay
     echo "  ✓ Installed /usr/local/bin/camera-relay"
+
+    # The browser helper has to outlive this source tree. Its running-browser
+    # guard skips any profile whose browser is open — the common case during an
+    # install — so "quit the browser and re-run it" is the normal path, not the
+    # exception, and by then the extracted tarball is usually gone.
+    if [[ -f "$RELAY_DIR/chromium-pipewire-camera.sh" ]]; then
+        sudo install -m 755 "$RELAY_DIR/chromium-pipewire-camera.sh" \
+            /usr/local/bin/chromium-pipewire-camera
+        echo "  ✓ Installed /usr/local/bin/chromium-pipewire-camera"
+    fi
 
     # Install systray runtime dependency (Python AppIndicator binding).
     # Without this, camera-relay-systray.py falls back to Gtk.StatusIcon,
@@ -1046,6 +1217,19 @@ EOF
             || echo "gtk-update-icon-cache failed — icons may not appear until next login"
     else
         echo "Could not detect logged-in user — icons not installed"
+    fi
+
+    # Chromium-family browsers cannot see the relay node at all. Their V4L2
+    # enumeration accepts a device only when it reports VIDEO_CAPTURE and *not*
+    # VIDEO_OUTPUT, and the relay under exclusive_caps=0 reports both — so
+    # Chrome, Brave, Edge and every Electron app list zero cameras while Firefox
+    # (which accepts dual caps) works. Point them at PipeWire instead, where
+    # WirePlumber already publishes the relay as an ordinary camera source.
+    # Advisory: never fail the install over a browser preference.
+    if [[ -x "$RELAY_DIR/chromium-pipewire-camera.sh" ]]; then
+        echo ""
+        echo "  Configuring Chromium-family browsers..."
+        "$RELAY_DIR/chromium-pipewire-camera.sh" enable || true
     fi
 else
     echo "  ⚠ camera-relay directory not found — skipping relay tool installation"
@@ -1143,10 +1327,17 @@ echo "  Browser setup (if camera doesn't appear in browser):"
 echo "    Firefox:  about:config → media.webrtc.camera.allow-pipewire = true"
 echo "              For full resolution: media.navigator.video.default_width = 1920"
 echo "                                   media.navigator.video.default_height = 1080"
-echo "    Chrome:   Works out of the box with the V4L2 camera relay"
-echo "    Troubleshooting: If your browser doesn't see the camera, try enabling"
-echo "      chrome://flags/#enable-webrtc-pipewire-camera — but note this flag"
-echo "      can break camera access in some Chromium-based browsers."
+echo "    Chrome/Chromium/Brave: cannot see the V4L2 relay at all — they only"
+echo "      accept a device that reports capture WITHOUT output, and the relay"
+echo "      reports both. They go through PipeWire instead, which is what the"
+echo "      flag above enables. If it was skipped because the browser was open,"
+echo "      quit it and run: chromium-pipewire-camera"
+echo "    Edge:     edge://flags does not expose the entry, so nothing can be"
+echo "      written to its profile — launch it with"
+echo "      --enable-features=WebRtcPipeWireCamera instead."
+echo "    Electron apps (Slack, Discord, Teams): same V4L2 filter, but the"
+echo "      switch does not help — PipeWire camera is not wired into Electron."
+echo "    Run 'camera-relay doctor' to see the flag state per browser."
 echo ""
 echo "  Non-PipeWire apps (Zoom, OBS, VLC) use the on-demand camera relay."
 echo "  The relay is enabled and will auto-start on login (near-zero idle CPU)."

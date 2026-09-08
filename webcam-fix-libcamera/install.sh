@@ -41,17 +41,22 @@ FORCE_LIBCAMERA_REBUILD=false
 # ship it under a consolidated module name; the in-tree detection below already
 # handles the common cases, but this flag is the escape hatch when it doesn't.
 SKIP_MODULE_CHECK=false
+NO_RESTART=false
 for arg in "$@"; do
     case "$arg" in
         --force-libcamera-rebuild) FORCE_LIBCAMERA_REBUILD=true ;;
         --skip-module-check) SKIP_MODULE_CHECK=true ;;
+        --no-restart) NO_RESTART=true ;;
         -h|--help)
-            echo "Usage: $0 [--force-libcamera-rebuild] [--skip-module-check]"
+            echo "Usage: $0 [--force-libcamera-rebuild] [--skip-module-check] [--no-restart]"
             echo "  --force-libcamera-rebuild  Always build the patched libcamera from source"
             echo "                             (use if your packaged libcamera's OV02C10 helper"
             echo "                             doesn't register at runtime, e.g. Arch/CachyOS)"
             echo "  --skip-module-check        Continue even if the IVSC/IPU6 kernel modules"
             echo "                             can't be found by name (built-in or renamed)"
+            echo "  --no-restart               Never restart PipeWire. The camera will not be"
+            echo "                             verified at the end; reboot and run"
+            echo "                             'camera-relay doctor' instead"
             exit 0
             ;;
         *) echo "WARNING: unknown argument '$arg' (ignored)" ;;
@@ -60,7 +65,16 @@ done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIBCAMERA_MIN_VER="0.7.0"
-LIBCAMERA_BUILD_VER="v0.7.0"
+# Build 0.7.2, not 0.7.0. libcamera 0.7.0's SoftISP AGC has a bug that breaks
+# auto-exposure: soft_simple.cpp computes `again10 = camHelper_->gain(1.0)`, but
+# gain() takes an integer hardware code, so the float 1.0 truncates to 1 and
+# again10 becomes ~0.0625x. The AGC "too bright" branch then always chooses to
+# reduce gain (already at min) and never reduces exposure, so a bright scene stays
+# blown out to pure white. Fixed upstream in v0.7.1 (commit 02277d4c). 0.7.2 keeps
+# the same libcamera.so.0.7 soname, and being a higher patch than the 0.7.0 some
+# distros ship, ldconfig prefers our build for direct-libcamera apps too — closing
+# the long-standing gap where cam/Snapshot hit the distro lib. (issue #71)
+LIBCAMERA_BUILD_VER="v0.7.2"
 LIBCAMERA_BUILD_DIR="/tmp/libcamera-ipu6-build"
 
 echo "=============================================="
@@ -80,28 +94,70 @@ fi
 # ──────────────────────────────────────────────
 # [2/14] Distro detection
 # ──────────────────────────────────────────────
-echo "[2/14] Detecting distro..."
-if command -v pacman >/dev/null 2>&1; then
-    DISTRO="arch"
-    DISTRO_LABEL="Arch-based"
-elif command -v dnf >/dev/null 2>&1; then
-    DISTRO="fedora"
-    DISTRO_LABEL="Fedora/DNF-based"
-elif command -v apt >/dev/null 2>&1; then
-    if [[ -f /etc/os-release ]] && grep -qiE '^ID=(ubuntu|pop|linuxmint)' /etc/os-release; then
-        DISTRO="ubuntu"
-        DISTRO_LABEL="Ubuntu/Ubuntu-based"
-    elif [[ -f /etc/os-release ]] && grep -qiE '^ID_LIKE=.*ubuntu' /etc/os-release; then
-        DISTRO="ubuntu"
-        DISTRO_LABEL="Ubuntu-based ($(grep '^PRETTY_NAME=' /etc/os-release | cut -d= -f2 | tr -d '"'))"
-    else
-        DISTRO="debian"
-        DISTRO_LABEL="Debian-based"
+# Identify the distro from os-release (ID first, then ID_LIKE) and only fall
+# back to probing for a package manager when os-release gives no answer. The
+# binary probe alone is not trustworthy: Fedora ships a real `pacman` package,
+# so a Fedora host with it installed used to be detected as Arch and step
+# [9/14] then tried to install Arch package names with pacman.
+# Takes an optional os-release path (default /etc/os-release) so tests can
+# feed it fixture files. Sets DISTRO and DISTRO_LABEL.
+detect_distro() {
+    local os_release="${1:-/etc/os-release}"
+    local id="" id_like="" pretty_name="" key value
+
+    if [[ -r "$os_release" ]]; then
+        while IFS='=' read -r key value; do
+            value="${value%\"}"; value="${value#\"}"
+            value="${value%\'}"; value="${value#\'}"
+            case "$key" in
+                ID)          id="${value,,}" ;;
+                ID_LIKE)     id_like="${value,,}" ;;
+                PRETTY_NAME) pretty_name="$value" ;;
+            esac
+        done < "$os_release"
     fi
-else
-    echo "ERROR: Unsupported distro. This script requires pacman (Arch), dnf (Fedora), or apt (Ubuntu)."
-    exit 1
-fi
+
+    case "$id" in
+        arch)                 DISTRO="arch";   DISTRO_LABEL="Arch-based" ;;
+        fedora)               DISTRO="fedora"; DISTRO_LABEL="Fedora/DNF-based" ;;
+        ubuntu|pop|linuxmint) DISTRO="ubuntu"; DISTRO_LABEL="Ubuntu/Ubuntu-based" ;;
+        debian)               DISTRO="debian"; DISTRO_LABEL="Debian-based" ;;
+    esac
+
+    # ID_LIKE is a space-separated ancestry list, e.g. EndeavourOS has
+    # ID=endeavouros ID_LIKE=arch and Pop!_OS has ID_LIKE="ubuntu debian".
+    # Ubuntu is checked before Debian so Ubuntu descendants keep apt PPAs.
+    if [[ -z "$DISTRO" ]]; then
+        case " $id_like " in
+            *" arch "*)   DISTRO="arch";   DISTRO_LABEL="Arch-based (${pretty_name:-$id})" ;;
+            *" fedora "*) DISTRO="fedora"; DISTRO_LABEL="Fedora/DNF-based (${pretty_name:-$id})" ;;
+            *" ubuntu "*) DISTRO="ubuntu"; DISTRO_LABEL="Ubuntu-based (${pretty_name:-$id})" ;;
+            *" debian "*) DISTRO="debian"; DISTRO_LABEL="Debian-based (${pretty_name:-$id})" ;;
+        esac
+    fi
+
+    # Last resort for systems without a usable os-release: probe package
+    # managers and accept the ambiguity that has on hybrid systems.
+    if [[ -z "$DISTRO" ]]; then
+        if command -v pacman >/dev/null 2>&1; then
+            DISTRO="arch";   DISTRO_LABEL="Arch-based"
+        elif command -v dnf >/dev/null 2>&1; then
+            DISTRO="fedora"; DISTRO_LABEL="Fedora/DNF-based"
+        elif command -v apt >/dev/null 2>&1; then
+            DISTRO="debian"; DISTRO_LABEL="Debian-based"
+        fi
+    fi
+
+    if [[ -z "$DISTRO" ]]; then
+        echo "ERROR: Unsupported distro. This script supports Arch, Fedora, and Ubuntu/Debian (and derivatives)."
+        exit 1
+    fi
+}
+
+echo "[2/14] Detecting distro..."
+DISTRO=""
+DISTRO_LABEL=""
+detect_distro
 echo "  ✓ $DISTRO_LABEL detected"
 
 # ──────────────────────────────────────────────
@@ -791,7 +847,22 @@ PATCH_EOF
         -Dpycamera=disabled
 
     ninja -C build -j$(nproc)
-    sudo ninja -C build install
+    # Install with the same meson that configured the build. /usr/bin/meson is a
+    # thin wrapper that imports whichever mesonbuild module Python can see: for
+    # the invoking user that may be a pip install under ~/.local, but sudo's
+    # secure_path hides it and root falls back to the older distro mesonbuild.
+    # The mismatch makes 'meson install' reject the install.dat setup just wrote
+    # ("references functions or classes that don't exist"), so the whole build is
+    # thrown away at the final step. Hand root the user's module path when the
+    # two differ.
+    MESON_USER_SITE=$(python3 -c 'import site; print(site.getusersitepackages())' 2>/dev/null || true)
+    if [[ -n "$MESON_USER_SITE" && -d "$MESON_USER_SITE/mesonbuild" ]] && \
+       [[ "$(meson --version 2>/dev/null)" != "$(sudo meson --version 2>/dev/null)" ]]; then
+        echo "  Note: root's meson differs from yours — installing with PYTHONPATH=$MESON_USER_SITE"
+        sudo env PYTHONPATH="${MESON_USER_SITE}${PYTHONPATH:+:$PYTHONPATH}" ninja -C build install
+    else
+        sudo ninja -C build install
+    fi
 
     # Ensure the source-built libcamera is in the dynamic linker search path.
     # meson's libdir under /usr/local differs by distro: Ubuntu/Debian use
@@ -963,6 +1034,35 @@ cleanup_stale_local_libcamera() {
     fi
 }
 
+# camera-relay's pipeline IS gst-launch-1.0, and every libcamerasrc probe in this
+# installer shells out to gst-inspect-1.0. On Debian/Ubuntu both live in
+# gstreamer1.0-tools, which gstreamer1.0-libcamera does NOT depend on — so a
+# desktop install can easily lack them. When they are missing every probe exits
+# 127 and reads as "libcamerasrc is broken", which aborts the install below on a
+# false premise and later makes the relay tell users to reinstall a libcamera
+# plugin they already have (issue #65).
+ensure_gst_tools() {
+    if command -v gst-launch-1.0 &>/dev/null && command -v gst-inspect-1.0 &>/dev/null; then
+        return 0
+    fi
+    echo "  Installing GStreamer command-line tools..."
+    case "$DISTRO" in
+        fedora) sudo dnf install -y gstreamer1 2>/dev/null || true ;;
+        arch)   sudo pacman -S --needed --noconfirm gstreamer 2>/dev/null || true ;;
+        ubuntu|debian) sudo apt-get install -y gstreamer1.0-tools 2>/dev/null || true ;;
+    esac
+    if ! command -v gst-launch-1.0 &>/dev/null || ! command -v gst-inspect-1.0 &>/dev/null; then
+        echo ""
+        echo "ERROR: gst-launch-1.0 / gst-inspect-1.0 are still not available."
+        echo "       The camera relay is built on them and cannot run without them."
+        echo "       Install manually and re-run:"
+        echo "         Fedora:        sudo dnf install gstreamer1"
+        echo "         Arch:          sudo pacman -S gstreamer"
+        echo "         Ubuntu/Debian: sudo apt install gstreamer1.0-tools"
+        exit 1
+    fi
+}
+
 # Verify the libcamera setup is functional before continuing. Silent failures
 # here are what created issue #45: a source build was installed to /usr/local
 # but the gst plugin wouldn't load, so the relay was permanently broken.
@@ -1059,7 +1159,9 @@ fi
 
 # Sanity check: after whichever path we took, libcamerasrc must actually load.
 # This catches the issue #45 scenario where a source build silently produced an
-# unloadable libgstlibcamera.so.
+# unloadable libgstlibcamera.so. Make sure gst-inspect-1.0 exists first, or the
+# check below fails for the wrong reason (issue #65).
+ensure_gst_tools
 if ! verify_libcamerasrc; then
     echo ""
     echo "ERROR: GStreamer 'libcamerasrc' element is not loadable."
@@ -1076,6 +1178,30 @@ if ! verify_libcamerasrc; then
     exit 1
 fi
 
+# Whoever put a libcamera under /usr/local, the linker has to prefer it — the
+# source build above writes this file, but that branch is skipped when a good
+# enough libcamera is already installed. uninstall.sh removes the file
+# unconditionally, so an uninstall/reinstall cycle used to drop /usr/local out
+# of the search path and leave the *system* libcamera winning.
+#
+# Nothing breaks at that moment, because the ldconfig cache still holds the old
+# entries. It breaks at the next unrelated `ldconfig` — a package upgrade,
+# another installer — and then camera-relay-gst, which deliberately does not
+# propagate LD_LIBRARY_PATH, silently loads the unpatched build.
+if compgen -G "/usr/local/lib*/libcamera.so.*" > /dev/null \
+   || compgen -G "/usr/local/lib/*/libcamera.so.*" > /dev/null; then
+    if [[ ! -f /etc/ld.so.conf.d/libcamera-local.conf ]]; then
+        sudo tee /etc/ld.so.conf.d/libcamera-local.conf > /dev/null << 'EOF'
+/usr/local/lib
+/usr/local/lib64
+/usr/local/lib/x86_64-linux-gnu
+/usr/local/lib/aarch64-linux-gnu
+EOF
+        sudo ldconfig
+        echo "  ✓ Restored /usr/local to the dynamic linker search path"
+    fi
+fi
+
 # ──────────────────────────────────────────────
 # [10/14] Install PipeWire libcamera plugin
 # ──────────────────────────────────────────────
@@ -1087,17 +1213,41 @@ echo "[10/14] Installing PipeWire libcamera plugin..."
 # plugin against our source-built libcamera (0.4.x).
 rebuild_spa_plugin() {
     local PW_VER
-    PW_VER=$(pipewire --version 2>/dev/null | grep -oP 'libpipewire \K[0-9]+\.[0-9]+\.[0-9]+' || echo "1.0.5")
+    # 'pipewire --version' reports the version twice ("Compiled with libpipewire
+    # X.Y.Z" and "Linked with libpipewire X.Y.Z"), so an unbounded grep yields
+    # "1.0.5\n1.0.5". git rejects that as a branch name, the fallback clone below
+    # then silently takes the default branch, and the SPA plugin gets built
+    # against a completely different PipeWire ABI than the one running (master
+    # 1.7.x vs a system 1.0.x). The result loads without complaint but delivers
+    # zero frames, so PipeWire-native apps (GNOME Snapshot) show pure black while
+    # the v4l2 relay path keeps working — a confusing split. Take the first match.
+    PW_VER=$(pipewire --version 2>/dev/null | grep -oP 'libpipewire \K[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    PW_VER=${PW_VER:-1.0.5}
     echo "  Rebuilding PipeWire SPA libcamera plugin (PipeWire $PW_VER)..."
 
     local SPA_BUILD_DIR="/tmp/pipewire-spa-build"
     rm -rf "$SPA_BUILD_DIR"
-    git clone --depth 1 --branch "$PW_VER" \
-        https://gitlab.freedesktop.org/pipewire/pipewire.git "$SPA_BUILD_DIR" 2>/dev/null || \
-    git clone --depth 1 \
-        https://gitlab.freedesktop.org/pipewire/pipewire.git "$SPA_BUILD_DIR"
+    if ! git clone --depth 1 --branch "$PW_VER" \
+            https://gitlab.freedesktop.org/pipewire/pipewire.git "$SPA_BUILD_DIR" 2>/dev/null; then
+        echo "  ⚠ No upstream PipeWire tag '$PW_VER' — falling back to the default branch."
+        echo "    The plugin may then be built against a different PipeWire ABI than"
+        echo "    yours; if PipeWire-native apps show black afterwards, start here."
+        git clone --depth 1 \
+            https://gitlab.freedesktop.org/pipewire/pipewire.git "$SPA_BUILD_DIR"
+    fi
 
     cd "$SPA_BUILD_DIR"
+
+    # libcamera 0.7 changed ControlList::get(properties::Model) to hand back a
+    # std::optional<std::string_view>; PipeWire 1.0.x still returns it straight
+    # into a std::string, so the plugin does not compile against our source-built
+    # libcamera ("could not convert basic_string_view to std::string"). Convert
+    # explicitly. This is a no-op on PipeWire versions that already handle it.
+    if [[ -f spa/plugins/libcamera/libcamera-device.cpp ]]; then
+        sed -i 's/return std::move(model\.value());/return std::string(model.value());/' \
+            spa/plugins/libcamera/libcamera-device.cpp
+    fi
+
     PKG_CONFIG_PATH=/usr/local/lib/x86_64-linux-gnu/pkgconfig:$PKG_CONFIG_PATH \
         meson setup build \
         -Dsession-managers=[] \
@@ -1161,7 +1311,11 @@ case "$DISTRO" in
             if [[ -n "$SPA_LIBCAMERA_MINOR" ]] && [[ "$SPA_LIBCAMERA_MINOR" -lt 7 ]] && \
                [[ -n "$LOCAL_LIBCAMERA" ]]; then
                 echo "  SPA plugin links against libcamera $SPA_LIBCAMERA_VER (need >= 0.7)"
-                rebuild_spa_plugin
+                # Non-fatal: step 12 disables the direct libcamera node anyway, so a
+                # failure here costs nothing — apps reach the camera via the v4l2
+                # relay. Aborting the whole install over it would be worse.
+                rebuild_spa_plugin || \
+                    echo "  ⚠ SPA plugin rebuild failed — continuing (the libcamera node is disabled; apps use the v4l2 relay)"
             else
                 echo "  ✓ PipeWire libcamera SPA plugin ready"
             fi
@@ -1205,15 +1359,25 @@ done
 # Ubuntu path, otherwise the source build is ignored on Arch/Fedora and apps
 # silently fall back to the (possibly unpatched) distro libcamera. (issue #52)
 LOCAL_IPA_DIR=""
+LOCAL_LIBDIR=""
 for d in /usr/local/lib/x86_64-linux-gnu/libcamera /usr/local/lib/aarch64-linux-gnu/libcamera \
          /usr/local/lib64/libcamera /usr/local/lib/libcamera; do
-    if [[ -d "$d" ]] && ls "$d"/ipa_*.so >/dev/null 2>&1; then
-        LOCAL_IPA_DIR="$d"
-        break
-    fi
+    [[ -d "$d" ]] || continue
+    # libcamera >= 0.7 installs the IPA modules into an 'ipa' subdirectory;
+    # older builds drop them straight into <libdir>/libcamera. Check both — only
+    # matching the flat layout leaves LOCAL_IPA_DIR empty on 0.7+, which silently
+    # skips the whole block below and strands whatever stale
+    # LIBCAMERA_IPA_MODULE_PATH a previous install wrote. (issue #71)
+    for sub in "$d/ipa" "$d"; do
+        if ls "$sub"/ipa_*.so >/dev/null 2>&1; then
+            LOCAL_IPA_DIR="$sub"
+            LOCAL_LIBDIR="$(dirname "$d")"
+            break 2
+        fi
+    done
 done
 if [[ -n "$LOCAL_IPA_DIR" ]]; then
-    LOCAL_GST_DIR="$(dirname "$LOCAL_IPA_DIR")/gstreamer-1.0"
+    LOCAL_GST_DIR="$LOCAL_LIBDIR/gstreamer-1.0"
     sudo mkdir -p /etc/environment.d
     {
         echo "# libcamera IPA module path for source-built libcamera"
@@ -1236,7 +1400,11 @@ if [[ -n "$LOCAL_IPA_DIR" ]]; then
     export LIBCAMERA_IPA_MODULE_PATH="$LOCAL_IPA_DIR"
 fi
 
-# Ensure user is in video group (needed for non-root camera access)
+# Ensure user is in video group. This is no longer what grants access to the
+# raw camera nodes — those move to the memberless 'camera-relay' group in step
+# 12, and both the loopback and /dev/media0 carry their own uaccess ACL. Kept
+# because the group still covers other video devices and setups where uaccess
+# does not apply (no logind seat).
 CURRENT_USER="${SUDO_USER:-$USER}"
 if ! groups "$CURRENT_USER" 2>/dev/null | grep -q '\bvideo\b'; then
     sudo usermod -aG video "$CURRENT_USER"
@@ -1259,20 +1427,109 @@ if getent group kvm >/dev/null 2>&1; then
     fi
 fi
 
+# On a hybrid laptop — Intel/AMD iGPU + NVIDIA dGPU, which is how the Galaxy
+# Book4 Ultra ships, when the NVIDIA driver is actually bound to the dGPU (no
+# driver bound means no render node, and the detection below correctly declines
+# to pin) — GLVND loads the EGL vendor ICDs in /usr/share/glvnd/egl_vendor.d in
+# filename order, and NVIDIA's ships as 10_nvidia.json, ahead of Mesa's
+# 50_mesa.json. libcamera's Software ISP then runs its EGL debayer on NVIDIA's
+# proprietary driver, which it is not compatible with:
+#     ERROR eGL egl.cpp:134 glFrameBufferTexture2D error 36054
+#     ERROR Debayer debayer_egl.cpp:639 debayerGPU failed
+# The sensor still powers up (privacy LED on, relay says STREAMING) but not one
+# frame reaches v4l2loopback, so apps show a black picture. Same failure the
+# LIBCAMERA_SOFTISP_MODE=cpu block below was written for (#15, #50), but pinning
+# the iGPU fixes it without giving up the framerate (#66).
+#
+# This only bites under systemd: a desktop session normally has EGL already
+# resolved to Mesa, so running `cam` from a terminal works and the bug looks like
+# it isn't there. camera-relay bakes the pin into its own service unit (see
+# detect_egl_vendor_pin in ../camera-relay/camera-relay); detect the same thing
+# here so the state is visible at install time.
+#
+# Deliberately NOT written to /etc/environment.d like LIBCAMERA_SOFTISP_MODE
+# below: __EGL_VENDOR_LIBRARY_FILENAMES steers *every* GL client on the system,
+# so setting it globally would take NVIDIA offload away from games and everything
+# else. It belongs on the camera units only.
+# Keep this block in sync with webcam-fix-book5/install.sh.
+HYBRID_EGL_VENDOR=""
+HYBRID_GPU=false
+_nv_node=false
+_mesa_node=false
+_render_nodes=0
+for _node in /dev/dri/renderD*; do
+    [[ -e "$_node" ]] || continue
+    _render_nodes=$((_render_nodes + 1))
+    _drv=""
+    _link=$(readlink -f "/sys/class/drm/$(basename "$_node")/device/driver" 2>/dev/null) || _link=""
+    [[ -n "$_link" ]] && _drv=$(basename "$_link")
+    case "$_drv" in
+        nvidia|nvidia-drm) _nv_node=true ;;
+        "")                ;;
+        *)                 _mesa_node=true ;;
+    esac
+done
+if $_nv_node && $_mesa_node && [[ "$_render_nodes" -ge 2 ]]; then
+    HYBRID_GPU=true
+    # Derive the vendor ICD from the iGPU that is actually present rather than
+    # hardcoding 50_mesa.json: every non-NVIDIA render node here (i915, xe,
+    # amdgpu, radeon) is driven by Mesa's EGL, so the file to pin is whichever
+    # ICD dispatches to libEGL_mesa — whatever the distro numbered it.
+    for _dir in /etc/glvnd/egl_vendor.d /usr/share/glvnd/egl_vendor.d; do
+        [[ -d "$_dir" ]] || continue
+        for _f in "$_dir"/*.json; do
+            [[ -f "$_f" ]] || continue
+            if grep -q 'libEGL_mesa' "$_f" 2>/dev/null; then
+                HYBRID_EGL_VENDOR="$_f"
+                break 2
+            fi
+        done
+    done
+fi
+if [[ -n "$HYBRID_EGL_VENDOR" ]]; then
+    echo "  ✓ Hybrid GPU (iGPU + NVIDIA) — camera-relay.service will pin EGL to"
+    echo "    $HYBRID_EGL_VENDOR (keeps the GPU debayer off the NVIDIA driver)"
+elif $HYBRID_GPU; then
+    echo "  ⚠ Hybrid GPU detected but no Mesa EGL vendor file found in"
+    echo "    /usr/share/glvnd/egl_vendor.d — if the camera LED lights but apps show"
+    echo "    black, run 'camera-relay doctor' and check the GPU / EGL section"
+fi
+unset _node _link _drv _dir _f _nv_node _mesa_node _render_nodes
+
 # If an NVIDIA GPU is present, libcamera's GPU (EGL) debayer is unreliable
 # (debayer_egl.cpp is incompatible with NVIDIA's proprietary EGL driver, and on
 # hybrid laptops EGL may pick the NVIDIA renderer even when the iGPU is active).
-# camera-relay already forces CPU debayer on its own service unit, but the
-# PipeWire-libcamera path (used by apps that pick that source directly) needs it
-# too — so set it globally for all user services / sessions. (issue #50)
-if [[ -d /proc/driver/nvidia ]] || lspci 2>/dev/null | grep -qi 'VGA.*NVIDIA\|3D controller.*NVIDIA'; then
-    # Don't override if prime-select explicitly puts Intel in charge.
-    if ! { command -v prime-select >/dev/null 2>&1 && [[ "$(prime-select query 2>/dev/null)" == "intel" ]]; }; then
-        sudo mkdir -p /etc/environment.d
-        echo "LIBCAMERA_SOFTISP_MODE=cpu" | \
-            sudo tee /etc/environment.d/10-libcamera-softisp.conf > /dev/null
-        echo "  ✓ NVIDIA GPU detected — set LIBCAMERA_SOFTISP_MODE=cpu globally (CPU debayer)"
+# camera-relay pins EGL to the iGPU and, failing that, forces CPU debayer on its
+# own service unit — but the PipeWire-libcamera path (used by apps that pick that
+# source directly) needs a fix too, and only the CPU one is safe to set globally,
+# so set that here for all user services / sessions. (issue #50)
+# Only force CPU debayer when NVIDIA is the *active EGL renderer* — merely having
+# an NVIDIA card present is not enough. On a hybrid laptop rendering on the Intel
+# iGPU, EGL never touches the NVIDIA driver, so GPU debayer works fine and forcing
+# CPU costs a large chunk of framerate for nothing (issue #66). `prime-select` is
+# Ubuntu-only, so it can't be the sole guard. This mirrors camera-relay's own
+# detection — keep the two in sync.
+NVIDIA_ACTIVE=""
+if command -v glxinfo >/dev/null 2>&1; then
+    # glxinfo is authoritative: it reports the renderer actually in use.
+    if glxinfo 2>/dev/null | grep -qi "opengl renderer.*nvidia"; then
+        NVIDIA_ACTIVE="yes"
     fi
+elif [[ -d /proc/driver/nvidia ]] || lspci 2>/dev/null | grep -qi 'VGA.*NVIDIA\|3D controller.*NVIDIA'; then
+    # No glxinfo — fall back to presence, unless prime-select puts Intel in charge.
+    if ! { command -v prime-select >/dev/null 2>&1 && [[ "$(prime-select query 2>/dev/null)" == "intel" ]]; }; then
+        NVIDIA_ACTIVE="maybe"
+    fi
+fi
+if [[ -n "$NVIDIA_ACTIVE" ]]; then
+    sudo mkdir -p /etc/environment.d
+    echo "LIBCAMERA_SOFTISP_MODE=cpu" | \
+        sudo tee /etc/environment.d/10-libcamera-softisp.conf > /dev/null
+    echo "  ✓ NVIDIA is the active renderer — set LIBCAMERA_SOFTISP_MODE=cpu globally (CPU debayer)"
+    [[ "$NVIDIA_ACTIVE" == "maybe" ]] && \
+        echo "    (couldn't confirm via glxinfo — install mesa-utils/glx-utils if your camera framerate is low)"
+else
+    sudo rm -f /etc/environment.d/10-libcamera-softisp.conf
 fi
 
 # ──────────────────────────────────────────────
@@ -1281,17 +1538,143 @@ fi
 echo ""
 echo "[12/14] Hiding raw IPU6 nodes from applications..."
 
-# Remove session-level ACL from raw V4L2 nodes (keeps file permissions intact
-# so libcamera can still access them via the video group)
-sudo tee /etc/udev/rules.d/90-hide-ipu6-v4l2.rules > /dev/null << 'EOF'
-# Remove uaccess tag from raw Intel IPU6 ISYS V4L2 nodes.
-# libcamera accesses these via /dev/media0 and the video device nodes.
-# TAG-="uaccess" removes session-level permissions added by systemd.
-SUBSYSTEM=="video4linux", KERNEL=="video*", ATTR{name}=="Intel IPU6 ISYS Capture*", TAG-="uaccess"
-SUBSYSTEM=="video4linux", KERNEL=="video*", ATTR{name}=="Intel IPU6 CSI2*", TAG-="uaccess"
+# The ISYS driver registers one capture node per possible stream — 48 on a
+# Book4 — and the kernel flags each one V4L2_CAP_IO_MC: usable only once
+# userspace has configured the media graph, never as a standalone camera.
+# Nothing carries that bit into udev (systemd's v4l_id derives
+# ID_V4L_CAPABILITIES from V4L2_CAP_VIDEO_CAPTURE alone and never looks at
+# IO_MC), so all 48 advertise themselves as cameras.
+#
+# Applications split into two groups needing different answers:
+#   - Chromium and friends enumerate through udev, so clearing the capability
+#     properties is enough to drop them from those pickers.
+#   - Firefox/libwebrtc walks /dev/video0..63 calling QUERYCAP, ignores udev
+#     entirely, and only skips a node whose open() fails. Permissions are the
+#     only lever that works there.
+#
+# Hence the dedicated group: the nodes move out of 'video' (which the desktop
+# user is in, so it granted access no matter what happened to the uaccess tag)
+# into a group with no members. The relay's pipeline gets it from the setgid
+# launcher instead — see camera-relay-gst.c.
+CAMERA_RELAY_SRC="$SCRIPT_DIR/../camera-relay"
+
+sudo mkdir -p /usr/local/lib/sysusers.d
+sudo tee /usr/local/lib/sysusers.d/camera-relay.conf > /dev/null << 'EOF'
+# Owns the raw MC-centric camera nodes. Deliberately memberless: the relay
+# pipeline acquires it through the setgid launcher, nothing else should hold it.
+g camera-relay -
 EOF
-sudo udevadm control --reload-rules
-sudo udevadm trigger --action=change --subsystem-match=video4linux
+command -v systemd-sysusers >/dev/null 2>&1 && sudo systemd-sysusers >/dev/null 2>&1 || true
+if ! getent group camera-relay >/dev/null 2>&1; then
+    sudo groupadd -r camera-relay
+fi
+echo "  ✓ Group 'camera-relay' present (no members by design)"
+
+# Writable state for the pipeline's own caches. The GStreamer registry maps
+# elements to .so paths that get dlopen()ed, so it must not live anywhere the
+# user can write — that would hand the group back through a poisoned cache.
+sudo install -d -m 2770 -o root -g camera-relay /var/cache/camera-relay
+
+MC_HELPER=/usr/local/lib/udev/camera-relay-v4l2-io-mc
+
+# Ordering here is a safety property, not tidiness. The moment the rule below
+# takes effect the raw nodes belong to 'camera-relay', and the only thing that
+# can still open them is the setgid launcher — so the launcher has to exist
+# first. Build both helpers up front and install the rule only if both are in
+# place; if either fails, the nodes keep their old ownership and the camera
+# keeps working with the spurious entries still listed. A degraded camera list
+# beats a camera nothing can open.
+MC_HELPER_OK=""
+LAUNCHER_OK=""
+if gcc -O2 -Wall -o /tmp/camera-relay-v4l2-io-mc "$CAMERA_RELAY_SRC/v4l2-io-mc.c" 2>/dev/null; then
+    sudo install -d -m 755 /usr/local/lib/udev
+    sudo install -m 755 /tmp/camera-relay-v4l2-io-mc "$MC_HELPER"
+    rm -f /tmp/camera-relay-v4l2-io-mc
+    MC_HELPER_OK=1
+fi
+
+if [[ -f "$CAMERA_RELAY_SRC/camera-relay-gst.c" ]] \
+   && gcc -O2 -Wall -o /tmp/camera-relay-gst "$CAMERA_RELAY_SRC/camera-relay-gst.c" 2>/dev/null; then
+    sudo install -o root -g camera-relay -m 755 \
+        /tmp/camera-relay-gst /usr/local/bin/camera-relay-gst
+    # After the group change: chgrp clears S_ISGID, so `install -m 2755 -g ...`
+    # silently lands as plain 0755 and the launcher cannot reach the nodes.
+    sudo chmod 2755 /usr/local/bin/camera-relay-gst
+    rm -f /tmp/camera-relay-gst
+    LAUNCHER_OK=1
+    echo "  ✓ Installed /usr/local/bin/camera-relay-gst (setgid camera-relay)"
+else
+    echo "  ⚠ Failed to build the pipeline launcher (gcc required)."
+fi
+
+if [[ -n "$MC_HELPER_OK" && -n "$LAUNCHER_OK" ]]; then
+    sudo tee /etc/udev/rules.d/74-camera-relay-mc-nodes.rules > /dev/null << 'EOF'
+# Raw MC-centric V4L2 nodes are not standalone cameras. Keyed off the kernel's
+# own V4L2_CAP_IO_MC rather than a driver-specific card name, so this covers
+# IPU6, IPU7 and anything else media-controller based.
+#
+# The 74- prefix is load-bearing, pinned by three stock rule files:
+#   60-persistent-v4l.rules  runs v4l_id, which sets the properties cleared below
+#   73-seat-late.rules       queues RUN{builtin}+="uaccess", the session ACL
+#   95-cd-devices.rules      hands anything with ID_V4L_PRODUCT to colord
+#
+# Note what does NOT work, because it looks like it should: TAG-="uaccess" on
+# its own. 70-uaccess.rules tags every video4linux device unconditionally, and
+# the TAG== test in 73 matches the *sticky* tag list, which TAG-= does not
+# touch. So the ACL is granted no matter where this file sits, and the node
+# stays openable — which is what kept the nodes visible in app pickers even
+# with a rule that appeared to remove the tag. Stripping the ACL afterwards is
+# the reliable option: RUN entries execute in the order rules added them, so
+# the setfacl below lands after 73's builtin.
+#
+# TAG-= is still worth keeping. It clears the *current* tag list, which is what
+# logind re-enumerates when a session becomes active — without it the ACL comes
+# back on the next login.
+ACTION=="remove", GOTO="camera_relay_mc_end"
+SUBSYSTEM!="video4linux", GOTO="camera_relay_mc_end"
+
+# Only probe when the classification is not already known. udev runs as root,
+# so opening the node succeeds even after the group change below.
+KERNEL=="video*", ENV{ID_V4L_IO_MC}=="", \
+  IMPORT{program}="/usr/local/lib/udev/camera-relay-v4l2-io-mc $devnode"
+
+# Out of 'video' (the desktop user is in it), and no longer claiming to be a
+# camera. Clearing ID_V4L_PRODUCT is what stops colord: 95-cd-devices.rules
+# keys on the product name, not on the capabilities.
+ENV{ID_V4L_IO_MC}=="1", GROUP="camera-relay", MODE="0660", TAG-="uaccess", \
+  ENV{ID_V4L_CAPABILITIES}="", ENV{ID_V4L_PRODUCT}="", \
+  RUN+="/usr/bin/setfacl -b $devnode"
+
+LABEL="camera_relay_mc_end"
+EOF
+
+    # Superseded: matched card names instead of the capability, and only
+    # dropped the uaccess tag while the 'video' group kept granting access —
+    # so it never actually hid anything.
+    sudo rm -f /etc/udev/rules.d/90-hide-ipu6-v4l2.rules
+    # Earlier revisions of this fix; both relied on TAG-= alone, which cannot
+    # stop the uaccess ACL (see the header of the rule above).
+    sudo rm -f /etc/udev/rules.d/90-camera-relay-mc-nodes.rules \
+               /etc/udev/rules.d/72-camera-relay-mc-nodes.rules
+
+    # The rule strips the session ACL with setfacl; without it the raw nodes
+    # stay open to the desktop user and keep showing up in camera lists.
+    if [[ ! -x /usr/bin/setfacl ]]; then
+        echo "  ⚠ /usr/bin/setfacl missing — install the 'acl' package, otherwise"
+        echo "    the raw nodes keep their session ACL and stay visible in apps."
+    fi
+
+    sudo udevadm control --reload-rules
+    # The rule's own RUN strips the ACL, so this trigger fixes the running
+    # session too — no reboot needed.
+    sudo udevadm trigger --action=change --subsystem-match=video4linux
+    echo "  ✓ Raw MC-centric nodes reassigned to the camera-relay group"
+else
+    # Deliberately leave the nodes alone. Reassigning them without a launcher
+    # to reach them would take the camera out entirely.
+    echo "  ⚠ Skipping the MC-node rule — the helpers did not build (gcc required)."
+    echo "    Raw nodes stay visible in app camera lists; the camera still works."
+fi
 
 # WirePlumber rule to hide raw IPU6 V4L2 nodes from PipeWire
 # This prevents ~48 unusable "ipu6 (V4L2)" entries in app camera lists.
@@ -1318,7 +1701,26 @@ rule = {
 }
 table.insert(v4l2_monitor.rules, rule)
 WPEOF
-    echo "  ✓ WirePlumber Lua rule installed (v4l2 nodes hidden)"
+    sudo tee /etc/wireplumber/main.lua.d/52-disable-libcamera-node.lua > /dev/null << 'WPEOF'
+-- Disable the direct libcamera node in PipeWire; apps use the v4l2 relay.
+-- PipeWire's libcamera SPA plugin cannot stream this sensor on PipeWire 1.0.x
+-- against a source-built libcamera 0.7.x: it negotiates a 640x480 fallback,
+-- emits one black frame and then stalls. PipeWire-native apps (GNOME Snapshot)
+-- pick that node over the relay and show pure black, while every v4l2 app works
+-- — which reads as "the camera is broken" rather than "one node is broken".
+rule = {
+  matches = {
+    {
+      { "node.name", "matches", "libcamera_input.*" },
+    },
+  },
+  apply_properties = {
+    ["node.disabled"] = true,
+  },
+}
+table.insert(libcamera_monitor.rules, rule)
+WPEOF
+    echo "  ✓ WirePlumber Lua rules installed (raw v4l2 + libcamera nodes hidden)"
 else
     # WirePlumber 0.5+ — uses JSON conf.d
     sudo mkdir -p /etc/wireplumber/wireplumber.conf.d
@@ -1338,7 +1740,27 @@ monitor.v4l2.rules = [
   }
 ]
 WPEOF
-    echo "  ✓ WirePlumber conf.d rule installed (v4l2 nodes hidden)"
+    sudo tee /etc/wireplumber/wireplumber.conf.d/52-disable-libcamera-node.conf > /dev/null << 'WPEOF'
+# Disable the direct libcamera node in PipeWire; apps use the v4l2 relay.
+# PipeWire's libcamera SPA plugin cannot stream this sensor on PipeWire 1.0.x
+# against a source-built libcamera 0.7.x: it negotiates a 640x480 fallback,
+# emits one black frame and then stalls. PipeWire-native apps (GNOME Snapshot)
+# pick that node over the relay and show pure black, while every v4l2 app works
+# — which reads as "the camera is broken" rather than "one node is broken".
+monitor.libcamera.rules = [
+  {
+    matches = [
+      { node.name = "~libcamera_input.*" }
+    ]
+    actions = {
+      update-props = {
+        node.disabled = true
+      }
+    }
+  }
+]
+WPEOF
+    echo "  ✓ WirePlumber conf.d rules installed (raw v4l2 + libcamera nodes hidden)"
 fi
 
 echo "  ✓ Raw IPU6 nodes hidden from applications"
@@ -1362,6 +1784,10 @@ _relay_home=$(getent passwd "$_relay_user" | cut -d: -f6)
 RELAY_DIR="$SCRIPT_DIR/../camera-relay"
 
 if [[ -d "$RELAY_DIR" ]]; then
+    # gst-launch-1.0/gst-inspect-1.0 must exist before the probe below, or it
+    # exits 127 and misreads as "libcamerasrc missing" (issue #65).
+    ensure_gst_tools
+
     # Install GStreamer libcamerasrc element if not present
     if ! gst-inspect-1.0 libcamerasrc &>/dev/null 2>&1; then
         echo "  Installing GStreamer libcamera plugin..."
@@ -1374,6 +1800,9 @@ if [[ -d "$RELAY_DIR" ]]; then
                 sudo pacman -S --needed --noconfirm gst-plugin-libcamera 2>/dev/null || true
                 ;;
             ubuntu|debian)
+                # libcamerasrc ships in gstreamer1.0-libcamera on Ubuntu/Debian,
+                # not in gstreamer1.0-plugins-bad — try the correct package first.
+                sudo apt-get install -y gstreamer1.0-libcamera 2>/dev/null || \
                 sudo apt-get install -y gstreamer1.0-plugins-bad 2>/dev/null || true
                 ;;
         esac
@@ -1384,7 +1813,28 @@ if [[ -d "$RELAY_DIR" ]]; then
         echo "  Installing v4l2loopback..."
         case "$DISTRO" in
             fedora)
-                sudo dnf install -y v4l2loopback 2>/dev/null || true
+                # Fedora doesn't ship v4l2loopback in main repos — it lives in
+                # RPM Fusion (free) as `akmod-v4l2loopback` (auto-builds against
+                # the running kernel). Enable the repo if needed, then install.
+                if ! dnf repolist --enabled 2>/dev/null | grep -qE '^rpmfusion-free(\s|$)'; then
+                    FEDORA_VER=$(rpm -E %fedora 2>/dev/null || true)
+                    if [[ -n "$FEDORA_VER" ]]; then
+                        echo "  Enabling RPM Fusion (free) — required for akmod-v4l2loopback..."
+                        sudo dnf install -y \
+                            "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-${FEDORA_VER}.noarch.rpm" \
+                            || echo "  ⚠ Could not enable RPM Fusion automatically — see fallback hint below."
+                    fi
+                fi
+                # akmod auto-builds against running kernel and needs matching kernel headers.
+                sudo dnf install -y akmod-v4l2loopback kernel-devel-"$(uname -r)" 2>/dev/null \
+                    || sudo dnf install -y akmod-v4l2loopback kernel-devel 2>/dev/null \
+                    || true
+                # Trigger immediate build so the module is usable without a reboot.
+                if command -v akmods &>/dev/null; then
+                    echo "  Building v4l2loopback akmod against current kernel (this may take a minute)..."
+                    sudo akmods --force 2>/dev/null || true
+                    sudo depmod -a 2>/dev/null || true
+                fi
                 ;;
             arch)
                 sudo pacman -S --needed --noconfirm v4l2loopback-dkms 2>/dev/null || true
@@ -1393,6 +1843,20 @@ if [[ -d "$RELAY_DIR" ]]; then
                 sudo apt-get install -y v4l2loopback-dkms 2>/dev/null || true
                 ;;
         esac
+
+        # Re-check that the module is now installed; warn loudly if not.
+        # Without this the relay crash-loops forever and the only symptom the
+        # user sees is "the browser can't find my camera". (issue #51)
+        if ! modinfo v4l2loopback &>/dev/null 2>&1; then
+            echo "  ⚠ v4l2loopback kernel module still not available after install attempt."
+            if [[ "$DISTRO" == "fedora" ]]; then
+                echo "    On Fedora, ensure RPM Fusion (free) is enabled, then run:"
+                echo "      sudo dnf install -y https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-\$(rpm -E %fedora).noarch.rpm"
+                echo "      sudo dnf install -y akmod-v4l2loopback kernel-devel"
+                echo "      sudo akmods --force && sudo depmod -a"
+            fi
+            echo "    Camera relay will not function until v4l2loopback is available."
+        fi
     fi
 
     # ---------------------------------------------------------------
@@ -1452,22 +1916,30 @@ if [[ -d "$RELAY_DIR" ]]; then
     echo "v4l2loopback" | sudo tee /etc/modules-load.d/v4l2loopback.conf > /dev/null
     echo "  ✓ Installed v4l2loopback autoload (/etc/modules-load.d/v4l2loopback.conf)"
 
-    # Chromium/Chrome enumerate V4L2 cameras through udev and only list
-    # devices whose ID_V4L_CAPABILITIES udev property contains ":capture:".
-    # v4l_id (60-persistent-v4l.rules) tags the node ONCE at device creation
-    # — while the relay monitor holds the writer fd and no capture format is
-    # negotiated yet — so the property can come up without ":capture:" and
-    # Chrome never lists the camera (even though it streams capture fine, and
-    # libcamera/PipeWire apps like Cheese/Firefox work). Force the capture
-    # capability for the relay node so Chrome enumerates it. (issue #54)
+    # v4l_id (60-persistent-v4l.rules) tags the node ONCE at device creation —
+    # while the relay monitor holds the writer fd and no capture format is
+    # negotiated yet — so ID_V4L_CAPABILITIES can come up without ":capture:"
+    # and udev-based consumers misread the node. Normalise it here.
+    #
+    # This was originally added believing it was what made Chrome list the
+    # camera (issue #54). It is not: Chromium enumerates with base::FileEnumerator
+    # over /dev/video* and opens each node with VIDIOC_QUERYCAP — it never reads
+    # a udev property. Chrome stays blind to the relay with this rule applied and
+    # ID_V4L_CAPABILITIES=":capture:" set, because the node reports VIDEO_OUTPUT
+    # alongside VIDEO_CAPTURE. That is handled by the PipeWire flag below.
+    # The rule is kept because other udev consumers do read the property.
     sudo tee /etc/udev/rules.d/70-camera-relay-capabilities.rules > /dev/null << 'EOF'
-# Force ID_V4L_CAPABILITIES so Chromium/Chrome's udev-based V4L2 camera
-# enumeration lists the Camera Relay loopback. Runs after 60-persistent-v4l.
+# Normalise ID_V4L_CAPABILITIES for the Camera Relay loopback: v4l_id tags the
+# node before any capture format is negotiated, so the property can come up
+# without ":capture:". Runs after 60-persistent-v4l.
+#
+# Note: this does NOT affect Chromium. It enumerates /dev/video* directly and
+# never reads udev properties — see the PipeWire camera flag instead.
 SUBSYSTEM=="video4linux", ATTR{name}=="Camera Relay", ENV{ID_V4L_CAPABILITIES}=":capture:"
 EOF
     sudo udevadm control --reload-rules
     sudo udevadm trigger --action=change --subsystem-match=video4linux
-    echo "  ✓ Installed Camera Relay udev capabilities rule (Chrome/Chromium fix)"
+    echo "  ✓ Installed Camera Relay udev capabilities rule"
 
     # Rebuild initramfs so it picks up the new v4l2loopback config.
     # Without this, v4l2loopback may load from initramfs with stale
@@ -1514,10 +1986,24 @@ EOF
         fi
     fi
 
+    # The setgid launcher is built in step 12, before the udev rule hands the
+    # raw nodes to the camera-relay group — it has to exist before anything
+    # depends on it. Nothing to do here.
+
     # Install CLI tool
     sudo cp "$RELAY_DIR/camera-relay" /usr/local/bin/camera-relay
     sudo chmod 755 /usr/local/bin/camera-relay
     echo "  ✓ Installed /usr/local/bin/camera-relay"
+
+    # The browser helper has to outlive this source tree. Its running-browser
+    # guard skips any profile whose browser is open — the common case during an
+    # install — so "quit the browser and re-run it" is the normal path, not the
+    # exception, and by then the extracted tarball is usually gone.
+    if [[ -f "$RELAY_DIR/chromium-pipewire-camera.sh" ]]; then
+        sudo install -m 755 "$RELAY_DIR/chromium-pipewire-camera.sh" \
+            /usr/local/bin/chromium-pipewire-camera
+        echo "  ✓ Installed /usr/local/bin/chromium-pipewire-camera"
+    fi
 
     # Install systray runtime dependency (Python AppIndicator binding).
     # Without this, camera-relay-systray.py falls back to Gtk.StatusIcon,
@@ -1583,6 +2069,19 @@ EOF
     else
         echo "Could not detect logged-in user — icons not installed"
     fi
+
+    # Chromium-family browsers cannot see the relay node at all. Their V4L2
+    # enumeration accepts a device only when it reports VIDEO_CAPTURE and *not*
+    # VIDEO_OUTPUT, and the relay under exclusive_caps=0 reports both — so
+    # Chrome, Brave, Edge and every Electron app list zero cameras while Firefox
+    # (which accepts dual caps) works. Point them at PipeWire instead, where
+    # WirePlumber already publishes the relay as an ordinary camera source.
+    # Advisory: never fail the install over a browser preference.
+    if [[ -x "$RELAY_DIR/chromium-pipewire-camera.sh" ]]; then
+        echo ""
+        echo "  Configuring Chromium-family browsers..."
+        "$RELAY_DIR/chromium-pipewire-camera.sh" enable || true
+    fi
 else
     echo "  ⚠ camera-relay directory not found — skipping"
 fi
@@ -1593,9 +2092,58 @@ fi
 echo ""
 echo "[14/14] Restarting PipeWire and verifying camera..."
 
-# Restart PipeWire so it picks up the libcamera SPA plugin
-systemctl --user restart pipewire wireplumber 2>/dev/null || true
-sleep 3
+# Restarting PipeWire is not cosmetic: every application holding a stream loses
+# it, and most do not reconnect — browsers and Spotify in particular go silent
+# until restarted. Running a *camera* script and losing your speakers points
+# nowhere near its cause; during #80 testing it read as "the uninstall broke my
+# audio" and took a speaker-test to rule out. (issue #81)
+#
+# The restart is still load-bearing here, so this asks rather than dropping it:
+# the libcamera SPA plugin is loaded by the pipewire daemon itself, so bouncing
+# only wireplumber would not pick up a freshly built libcamera and the check
+# below would report a false negative. Skipping is safe — it degrades into the
+# "PipeWire hasn't picked it up yet, reboot" branch, which is already correct.
+pipewire_stream_apps() {
+    command -v pactl &>/dev/null || return 1
+    # One type per call. `pactl list sink-inputs source-outputs` exits 0 and
+    # prints NOTHING — it takes a single type and silently ignores the rest — so
+    # the combined form looks like "no streams are active" on every machine.
+    { pactl list sink-inputs 2>/dev/null
+      pactl list source-outputs 2>/dev/null
+    } | sed -n 's/^[[:space:]]*application\.name = "\(.*\)"/\1/p' | sort -u
+}
+
+PIPEWIRE_RESTARTED=false
+_RESTART=true
+if [[ "$NO_RESTART" == true ]]; then
+    echo "  – Skipping PipeWire restart (--no-restart)."
+    _RESTART=false
+else
+    _IN_USE=$(pipewire_stream_apps || true)
+    if [[ -n "$_IN_USE" ]]; then
+        echo "  ⚠ A PipeWire restart drops the audio/video streams these apps hold,"
+        echo "    and most will not reconnect on their own:"
+        sed 's/^/      /' <<< "$_IN_USE"
+        echo ""
+        echo "    Skipping is safe — a reboot (which this script recommends anyway)"
+        echo "    achieves the same thing. It only defers the camera check below."
+        # `|| _ans=""` because this script runs under `set -e` and read returns 1
+        # on EOF, which would otherwise kill the install for a piped stdin.
+        read -rp "  Restart PipeWire now and interrupt them? [y/N] " _ans || _ans=""
+        case "$_ans" in
+            [yY]|[yY][eE][sS]) ;;
+            *) echo "  – Skipped. Reboot to finish, then check: camera-relay doctor"
+               _RESTART=false ;;
+        esac
+    fi
+fi
+
+if [[ "$_RESTART" == true ]]; then
+    # Restart PipeWire so it picks up the libcamera SPA plugin
+    systemctl --user restart pipewire wireplumber 2>/dev/null || true
+    sleep 3
+    PIPEWIRE_RESTARTED=true
+fi
 
 # Check if PipeWire sees the camera via libcamera
 CAMERA_FOUND=false
@@ -1656,6 +2204,10 @@ if $CAMERA_FOUND; then
     echo "         log out and back in for udev rules to take effect."
 elif $CAPTURE_OK; then
     echo "  libcamera detects the camera but PipeWire hasn't picked it up yet."
+    if ! $PIPEWIRE_RESTARTED; then
+        echo "  (expected — the PipeWire restart was skipped, so it has not"
+        echo "   reloaded the libcamera plugin yet.)"
+    fi
     echo ""
     echo "  This is normal on first install. Please:"
     echo "    1. Log out and back in (or reboot)"
@@ -1675,7 +2227,10 @@ echo ""
 echo "  Configuration files created:"
 echo "    /etc/modules-load.d/ivsc.conf"
 echo "    /etc/modprobe.d/ivsc-camera.conf"
-echo "    /etc/udev/rules.d/90-hide-ipu6-v4l2.rules"
+echo "    /etc/udev/rules.d/74-camera-relay-mc-nodes.rules"
+[[ -f /usr/local/lib/udev/camera-relay-v4l2-io-mc ]] && \
+    echo "    /usr/local/lib/udev/camera-relay-v4l2-io-mc"
+echo "    /usr/local/lib/sysusers.d/camera-relay.conf"
 [[ -f /etc/initramfs-tools/modules ]] && echo "    /etc/initramfs-tools/modules (updated)"
 [[ -f /etc/dracut.conf.d/ivsc-camera.conf ]] && echo "    /etc/dracut.conf.d/ivsc-camera.conf"
 [[ -f /etc/mkinitcpio.conf.d/ivsc-camera.conf ]] && echo "    /etc/mkinitcpio.conf.d/ivsc-camera.conf"
@@ -1694,15 +2249,27 @@ echo "    /usr/local/share/libcamera/ipa/simple/ov02c10.yaml"
 if [[ -f /usr/local/bin/camera-relay ]]; then
     echo "    /usr/local/bin/camera-relay"
     echo "    /usr/local/bin/camera-relay-monitor"
+    [[ -f /usr/local/bin/camera-relay-gst ]] && \
+        echo "    /usr/local/bin/camera-relay-gst"
     echo "    /etc/modprobe.d/99-camera-relay-loopback.conf"
 fi
 echo ""
 echo "  Browser setup:"
-echo "    Firefox:  Works out of the box (no flags needed)"
-echo "    Chrome:   Works out of the box with the V4L2 camera relay"
-echo "    Troubleshooting: If your browser doesn't see the camera, try enabling"
-echo "      chrome://flags/#enable-webrtc-pipewire-camera — but note this flag"
-echo "      can break camera access in some Chromium-based browsers."
+echo "    Firefox:  Usually needs no flags — it reads the relay node directly."
+echo "              Reported not to on Fedora, where the camera only works with"
+echo "              about:config → media.webrtc.camera.allow-pipewire = true"
+echo "              (issue #37). Check yours with: camera-relay doctor"
+echo "    Chrome/Chromium/Brave: cannot see the V4L2 relay at all — they only"
+echo "      accept a device that reports capture WITHOUT output, and the relay"
+echo "      reports both. They go through PipeWire instead, which is what the"
+echo "      flag above enables. If it was skipped because the browser was open,"
+echo "      quit it and run: chromium-pipewire-camera"
+echo "    Edge:     edge://flags does not expose the entry, so nothing can be"
+echo "      written to its profile — launch it with"
+echo "      --enable-features=WebRtcPipeWireCamera instead."
+echo "    Electron apps (Slack, Discord, Teams): same V4L2 filter, but the"
+echo "      switch does not help — PipeWire camera is not wired into Electron."
+echo "    Run 'camera-relay doctor' to see the flag state per browser."
 echo ""
 echo "  Cheese fix (if needed):"
 echo "    Cheese crashes with this camera. A standalone fix is available:"

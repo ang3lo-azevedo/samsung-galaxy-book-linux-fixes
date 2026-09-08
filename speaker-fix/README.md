@@ -16,7 +16,7 @@ To uninstall: `sudo ./uninstall.sh && sudo reboot`
 
 ---
 
-> **Battery Impact:** The speaker amplifiers are only powered on during active audio playback. When idle, the amps draw ~10μA per chip — effectively zero battery impact. The driver uses HDA playback hooks to enable the amps when audio starts and disable them when it stops. When native kernel support eventually lands (no confirmed timeline yet — see below), this package will auto-remove itself.
+> **Battery Impact:** The amps are enabled when the driver probes and stay on — they are **not** powered down when idle. The driver implements an HDA playback hook for on-demand power, but it never fires, because the in-kernel alc269 quirk that would create the HDA component master doesn't exist for these boards (see [Power Management](#power-management)). Enabling at probe is what makes the speakers work at all. If you want the amps genuinely off when idle, unload the modules — e.g. via [@MatiDegli's helper scripts](https://github.com/Andycodeman/samsung-galaxy-book-linux-fixes/discussions/4). When native kernel support eventually lands (no confirmed timeline yet — see below), this package will auto-remove itself.
 
 > **Secure Boot Users:** If you have Secure Boot enabled (most laptops do by default), you **must** enroll a Machine Owner Key (MOK) before the driver modules will load. If you've never installed a DKMS or out-of-tree kernel module before, you will need to complete a **one-time MOK enrollment** that involves a reboot and typing a password in a blue setup screen. See the [Secure Boot Setup](#secure-boot-setup) section below — **do this before running the install script**.
 
@@ -158,18 +158,37 @@ The upstream PR (#5616) touches 5 areas of the kernel:
 This DKMS package only implements #5 (the new driver) and works around #1-#4:
 
 - **Instead of scan.c + serial-multi-instantiate**: A systemd service dynamically finds the I2C bus via ACPI and creates the missing I2C devices via sysfs `new_device`
-- **Instead of the alc269 quirk**: The driver binds as an HDA component and uses playback hooks to enable/disable the amps on demand
+- **Instead of the alc269 quirk**: The driver enables the amps during probe (see Power Management below)
 - **Instead of the exported regmap**: A local `regmap_config` with `REGCACHE_NONE` is defined in the driver headers
 
 ### Power Management
 
-The driver uses HDA playback hooks to control the amplifiers:
+**The amps are enabled at probe and stay on. They are not powered down when idle.**
 
-- **Playback starts** (`HDA_GEN_PCM_ACT_OPEN`) → amps enable (`GLOBAL_EN=0x01`, `AMP_EN=0x81`)
-- **Playback stops** (`HDA_GEN_PCM_ACT_CLOSE`) → amps disable (`GLOBAL_EN=0x00`, `AMP_EN=0x80`)
-- **On init** → amps start in disabled state (no power draw until audio plays)
+The driver *does* implement an HDA playback hook (`max98390_hda_playback_hook()`), and registers
+itself as an HDA component via `component_add()`. But `component_add()` is only the *client* half
+of the contract — the *master* lives in the kernel's `comp_generic_fixup()` and is only created by
+an in-kernel alc269 quirk for the machine. That quirk doesn't exist for these Samsung boards (it's
+missing piece #2 above), so no master ever binds, the component never completes, and the playback
+hook is **never called**.
 
-The MAX98390 draws ~10μA per chip in disabled state — effectively zero battery impact when idle.
+That's exactly why the driver enables the amps in `max98390_configure_high_pass_filter()` at probe
+time (`DSP_GLOBAL_EN`, `SPK_EN`, `EN` → 1) instead: if it waited for the playback hook, there would
+be no sound at all. The trade-off is deliberate — working speakers, at the cost of idle power
+management.
+
+**Battery impact:** the MAX98390 draws ~10μA per chip only in its *disabled* state, which this
+package never reaches. The real idle draw is that of four enabled class-D amps. If you want them
+genuinely powered down when you're not playing audio, use [@MatiDegli's speaker-on/off helper
+scripts](https://github.com/Andycodeman/samsung-galaxy-book-linux-fixes/discussions/4) to unload
+the modules.
+
+This will resolve itself if/when the alc269 quirk lands upstream: the master would then bind, the
+playback hook would start firing, and on-demand power management would work as designed.
+
+*(Thanks to [@HCIMECHA](https://github.com/HCIMECHA), whose investigation in
+[#63](https://github.com/Andycodeman/samsung-galaxy-book-linux-fixes/issues/63) surfaced that no
+component master exists.)*
 
 ### I2C Bus Detection
 
@@ -218,6 +237,8 @@ speaker-fix/
 ## Sound Quality & EQ
 
 The speakers will sound noticeably **thinner and quieter** compared to Windows. This is expected — it's not a bug in the driver.
+
+> **Not the same as "the woofers are silent".** Expected-thin still has audible bass, and boosting the low end in an EQ still changes what you hear. If the woofers produce *no* bass at all and EQ has **zero** effect, that's a different problem — see **"Woofers produce no bass at all"** under [Troubleshooting](#troubleshooting).
 
 ### Why it sounds different from Windows
 
@@ -295,6 +316,20 @@ systemctl status max98390-hda-i2c-setup.service
 # Check kernel log for driver messages
 dmesg | grep -i max98390
 ```
+
+**Woofers produce no bass at all (tweeters work, EQ has no effect)?**
+
+All four amps probe fine, the tweeters play, but there is no low end — and boosting bass in EasyEffects or any other PipeWire-side EQ changes nothing. That last part is the tell: an EQ that does nothing means the attenuation is happening inside the amp, downstream of everything the host controls.
+
+**Under investigation — see [#93](https://github.com/Andycodeman/samsung-galaxy-book-linux-fixes/issues/93).** One contributing bug has been fixed: the DSM firmware blobs shipped by this package were transcribed from upstream PR #5616 with two rows wrong, so every DSM parameter past register `0x2380` (woofer) / `0x2330` (tweeter) landed in the wrong register, and the short tweeter blob made the driver read past the end of its array. Both blobs now match upstream byte for byte, with a build-time size check.
+
+That fix did **not** resolve the silent woofers on the machine that reported it (Book5 Pro 360, Lunar Lake), so the root cause is still open. If you hit this, please reinstall first — you want the corrected blobs before anything else is worth measuring:
+
+```bash
+sudo ./install.sh && sudo reboot
+```
+
+If the woofers are still silent afterwards, please say so on [#93](https://github.com/Andycodeman/samsung-galaxy-book-linux-fixes/issues/93) with your exact model and whether muting each amp individually changes what you hear — that's the measurement that will narrow it down.
 
 **Modules not loading with Secure Boot? ("required key not loaded")**
 

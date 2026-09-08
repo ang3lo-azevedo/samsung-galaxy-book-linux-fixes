@@ -160,7 +160,7 @@ let
     -- Disable raw V4L2 IPU7 ISYS capture nodes in PipeWire.
     -- These are internal pipeline nodes from the IPU7 kernel driver that output
     -- raw bayer data unusable by applications. libcamera handles the actual camera
-    -- pipeline and exposes a proper source; this rule only affects the V4L2 monitor.
+    -- pipeline and exposes a proper source. This rule only affects the V4L2 monitor.
 
     table.insert(v4l2_monitor.rules, {
       matches = {
@@ -178,7 +178,7 @@ let
     # Disable raw V4L2 IPU7 ISYS capture nodes in PipeWire.
     # These are internal pipeline nodes from the IPU7 kernel driver that output
     # raw bayer data unusable by applications. libcamera handles the actual camera
-    # pipeline and exposes a proper source; this rule only affects the V4L2 monitor.
+    # pipeline and exposes a proper source. This rule only affects the V4L2 monitor.
 
     monitor.v4l2.rules = [
       {
@@ -257,7 +257,7 @@ in
   # kernel driver may not update Bayer layout metadata after transform.
   # Patch libcamera Simple pipeline to recompute Bayer order from transform.
   # Also install the OV02C10 / OV02E10 sensor color tuning files into
-  # libcamera's IPA simple-pipeline data dir; without these, libcamera's
+  # libcamera's IPA simple-pipeline data dir. Without these, libcamera's
   # software ISP falls back to uncalibrated.yaml (no CCM) and produces a
   # heavily desaturated, green-tinted image.
   nixpkgs.overlays = [
@@ -273,7 +273,7 @@ in
           # back to a generic linear-gain default that fails on these
           # sensors: apps connect but get no usable frames (or a dim,
           # washed-out image). The bash installer's
-          # build-patched-libcamera.sh adds them via sed; we mirror that
+          # build-patched-libcamera.sh adds them via sed. We mirror that
           # here as a postPatch so the helpers land in the libcamera
           # derivation. Both sensors share the same gain model as OV02C10
           # (gain = value/16), confirmed by the OV02E10 datasheet.
@@ -360,7 +360,7 @@ in
       LIBCAMERA_IPA_MODULE_PATH = "${pkgs.libcamera}/lib/libcamera/ipa";
     } // lib.optionalAttrs cfg.videoFlip {
       # Consumed by the bundled libcamera bayer-fix patch only when sensor
-      # model is exactly "ov02e10"; strict opt-in, no effect on other
+      # model is exactly "ov02e10", strict opt-in with no effect on other
       # sensors or systems where the env var isn't set.
       LIBCAMERA_FORCE_OV02E10_ROTATION = "180";
     };

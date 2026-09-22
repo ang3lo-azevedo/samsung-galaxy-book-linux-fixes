@@ -1,22 +1,80 @@
-# Samsung Galaxy Book 5 webcam fix for IPU7/OV02C10/OV02E10.
-#
-# This module patches libcamera system-wide via nixpkgs.overlays. That overlay
-# cascades through the Nix fixed-point: patched libcamera -> pipewire ->
-# openal-soft / chromium / discord / qemu / webkitgtk / ... all get new store
-# hashes and must be rebuilt from source. To avoid the cascade, callers should
-# set `nixpkgsUnpatched` to a truly overlay-free package set
-# (inputs.nixpkgs.legacyPackages.${system}); see that option for details.
-# Using `prev.pipewire` inside the overlay does NOT work: `prev` evaluates
-# packages against the final fixed-point, so it is already tainted.
-{ config, lib, pkgs, ... }:
-
-let
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}: let
   cfg = config.hardware.samsungGalaxyBook.webcamFixBook5;
   inherit (config.boot) kernelPackages;
   inherit (kernelPackages) kernel;
   kernelUsesClang = kernel.stdenv.cc.isClang or false;
-  cc = if kernelUsesClang then pkgs.llvmPackages.clang-unwrapped else pkgs.gcc;
+  cc =
+    if kernelUsesClang
+    then pkgs.llvmPackages.clang-unwrapped
+    else pkgs.gcc;
   clangMakeFlags = lib.optionalString kernelUsesClang "LLVM=1 CC=${cc}/bin/clang LD=${pkgs.llvmPackages.lld}/bin/ld.lld";
+
+  # Scoped patched libcamera: same patches/yamls as upstream
+  # webcam-fix-book5.nix, but as a side package instead of a global
+  # nixpkgs.overlays override. System pkgs.libcamera (and therefore
+  # pipewire -> sdl2-compat -> ffmpeg -> qtwebengine/electron) stays stock
+  # and hits cache.nixos.org. Only the relay uses this build.
+  libcamera-book5 = pkgs.libcamera.overrideAttrs (old: {
+    patches =
+      (old.patches or [])
+      ++ [
+        ../webcam-fix-book5/libcamera-bayer-fix/bayer-fix-v0.7.patch
+      ];
+
+    postPatch =
+      (old.postPatch or "")
+      + ''
+        HELPER_FILE=""
+        for candidate in src/ipa/libipa/camera_sensor_helper.cpp \
+                         src/libcamera/sensor/camera_sensor_helper.cpp; do
+          if [ -f "$candidate" ]; then
+            HELPER_FILE="$candidate"
+            break
+          fi
+        done
+        if [ -n "$HELPER_FILE" ]; then
+          if ! grep -q 'CameraSensorHelperOv02c10' "$HELPER_FILE"; then
+            sed -i '/#endif.*__DOXYGEN__/i\
+        class CameraSensorHelperOv02c10 : public CameraSensorHelper\
+        {\
+        public:\
+        \tCameraSensorHelperOv02c10()\
+        \t{\
+        \t\tgain_ = AnalogueGainLinear{ 1, 0, 0, 16 };\
+        \t}\
+        };\
+        REGISTER_CAMERA_SENSOR_HELPER("ov02c10", CameraSensorHelperOv02c10)\
+        ' "$HELPER_FILE"
+          fi
+          if ! grep -q 'CameraSensorHelperOv02e10' "$HELPER_FILE"; then
+            sed -i '/#endif.*__DOXYGEN__/i\
+        class CameraSensorHelperOv02e10 : public CameraSensorHelper\
+        {\
+        public:\
+        \tCameraSensorHelperOv02e10()\
+        \t{\
+        \t\tgain_ = AnalogueGainLinear{ 1, 0, 0, 16 };\
+        \t}\
+        };\
+        REGISTER_CAMERA_SENSOR_HELPER("ov02e10", CameraSensorHelperOv02e10)\
+        ' "$HELPER_FILE"
+          fi
+        fi
+      '';
+    postInstall =
+      (old.postInstall or "")
+      + ''
+        install -Dm644 ${../webcam-fix-book5/ov02c10.yaml} \
+          $out/share/libcamera/ipa/simple/ov02c10.yaml
+        install -Dm644 ${../webcam-fix-book5/ov02e10.yaml} \
+          $out/share/libcamera/ipa/simple/ov02e10.yaml
+      '';
+  });
 
   visionDriversSrc = pkgs.fetchFromGitHub {
     owner = "intel";
@@ -31,8 +89,9 @@ let
 
     src = visionDriversSrc;
 
-    nativeBuildInputs = [ kernelPackages.kernel.dev cc pkgs.gnumake pkgs.perl ]
-      ++ lib.optionals kernelUsesClang [ pkgs.llvmPackages.lld ];
+    nativeBuildInputs =
+      [kernelPackages.kernel.dev cc pkgs.gnumake pkgs.perl]
+      ++ lib.optionals kernelUsesClang [pkgs.llvmPackages.lld];
 
     buildPhase = ''
       make -C ${kernelPackages.kernel.dev}/lib/modules/${kernelPackages.kernel.modDirVersion}/build \
@@ -56,8 +115,9 @@ let
 
     src = ../webcam-fix-book5/ipu-bridge-fix;
 
-    nativeBuildInputs = [ kernelPackages.kernel.dev cc pkgs.gnumake pkgs.perl ]
-      ++ lib.optionals kernelUsesClang [ pkgs.llvmPackages.lld ];
+    nativeBuildInputs =
+      [kernelPackages.kernel.dev cc pkgs.gnumake pkgs.perl]
+      ++ lib.optionals kernelUsesClang [pkgs.llvmPackages.lld];
 
     buildPhase = ''
       make -C ${kernelPackages.kernel.dev}/lib/modules/${kernelPackages.kernel.modDirVersion}/build \
@@ -81,7 +141,7 @@ let
 
     src = ../camera-relay;
 
-    nativeBuildInputs = [ pkgs.gcc ];
+    nativeBuildInputs = [pkgs.gcc];
 
     dontConfigure = true;
     dontFixup = true;
@@ -101,7 +161,7 @@ let
 
     src = ../camera-relay;
 
-    nativeBuildInputs = [ pkgs.makeWrapper ];
+    nativeBuildInputs = [pkgs.makeWrapper];
 
     dontConfigure = true;
     dontFixup = true;
@@ -116,25 +176,25 @@ let
       mkdir -p $out/bin
       makeWrapper $out/share/camera-relay/camera-relay $out/bin/camera-relay \
         --prefix PATH : ${lib.makeBinPath [
-          pkgs.bash
-          pkgs.coreutils
-          pkgs.findutils
-          pkgs.gawk
-          pkgs.gnugrep
-          pkgs.gnused
-          pkgs.kmod
-          pkgs.procps
-          pkgs.systemd
-          pkgs.util-linux
-          pkgs.libcamera
-          pkgs.gst_all_1.gstreamer
-          pkgs.gst_all_1.gst-plugins-base
-          pkgs.gst_all_1.gst-plugins-good
-          pkgs.gst_all_1.gst-plugins-bad
-        ]} \
-        --set LIBCAMERA_IPA_MODULE_PATH ${pkgs.libcamera}/lib/libcamera/ipa \
-        --prefix GST_PLUGIN_PATH : ${lib.makeSearchPath "lib/gstreamer-1.0" [ pkgs.libcamera ]} \
-        --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [ pkgs.libcamera ]}
+        pkgs.bash
+        pkgs.coreutils
+        pkgs.findutils
+        pkgs.gawk
+        pkgs.gnugrep
+        pkgs.gnused
+        pkgs.kmod
+        pkgs.procps
+        pkgs.systemd
+        pkgs.util-linux
+        libcamera-book5
+        pkgs.gst_all_1.gstreamer
+        pkgs.gst_all_1.gst-plugins-base
+        pkgs.gst_all_1.gst-plugins-good
+        pkgs.gst_all_1.gst-plugins-bad
+      ]} \
+        --set LIBCAMERA_IPA_MODULE_PATH ${libcamera-book5}/lib/libcamera/ipa \
+        --prefix GST_PLUGIN_PATH : ${lib.makeSearchPath "lib/gstreamer-1.0" [libcamera-book5]} \
+        --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [libcamera-book5]}
     '';
 
     meta = with lib; {
@@ -145,15 +205,15 @@ let
   };
 
   cameraRelayServiceEnvironment = {
-    LIBCAMERA_IPA_MODULE_PATH = "${pkgs.libcamera}/lib/libcamera/ipa";
+    LIBCAMERA_IPA_MODULE_PATH = "${libcamera-book5}/lib/libcamera/ipa";
     GST_PLUGIN_SYSTEM_PATH_1_0 = lib.makeSearchPath "lib/gstreamer-1.0" (map lib.getLib [
       pkgs.gst_all_1.gstreamer
       pkgs.gst_all_1.gst-plugins-base
       pkgs.gst_all_1.gst-plugins-good
       pkgs.gst_all_1.gst-plugins-bad
     ]);
-    GST_PLUGIN_PATH = lib.makeSearchPath "lib/gstreamer-1.0" [ pkgs.libcamera ];
-    LD_LIBRARY_PATH = lib.makeLibraryPath [ pkgs.libcamera ];
+    GST_PLUGIN_PATH = lib.makeSearchPath "lib/gstreamer-1.0" [libcamera-book5];
+    LD_LIBRARY_PATH = lib.makeLibraryPath [libcamera-book5];
   };
 
   wireplumberLuaRule = ''
@@ -195,28 +255,9 @@ let
   '';
 
   wireplumberUsesConf = lib.versionAtLeast (pkgs.wireplumber.version or "0.5") "0.5";
-in
-{
+in {
   options.hardware.samsungGalaxyBook.webcamFixBook5 = {
-    enable = lib.mkEnableOption "Samsung Galaxy Book 5 webcam fix (IPU7/OV02C10/OV02E10)";
-
-    nixpkgsUnpatched = lib.mkOption {
-      type = lib.types.nullOr lib.types.raw;
-      default = null;
-      description = ''
-        An unoverlay'd nixpkgs package set (e.g. `inputs.nixpkgs.legacyPackages.''${pkgs.system}`).
-
-        The libcamera overlay injected by this module cascades through the Nix
-        fixed-point into every package that links libpipewire (chromium, discord,
-        qemu, openal-soft, webkitgtk, ...), causing all of them to be rebuilt from
-        source. Setting this option breaks the cascade by pinning pipewire back to
-        the unpatched version, so only libcamera itself rebuilds. Camera apps access
-        the fix via the relay's v4l2loopback device regardless.
-
-        Without this option the cascade is unavoidable; callers that care about
-        binary-cache hits should always set it.
-      '';
-    };
+    enable = lib.mkEnableOption "Samsung Galaxy Book 5 webcam fix (IPU7/OV02C10/OV02E10, relay-scoped libcamera, no system overlay)";
 
     videoFlip = lib.mkOption {
       type = lib.types.bool;
@@ -224,17 +265,12 @@ in
       example = true;
       description = ''
         Force the OV02E10 sensor to be treated as rotation=180 inside
-        libcamera. This corrects the Bayer grid decoding (fixing purple
-        color tints) and provides rotation metadata to PipeWire.
+        the patched relay libcamera. This corrects the Bayer grid decoding
+        (fixing purple color tints) and provides rotation metadata.
 
         Enable this on Samsung Galaxy Book 360 / convertible models
         (NP960QHA, NP960QFG, NP960QGK, ...) where the OV02E10 sensor is
-        physically mounted inverted. Normally the bundled ipu-bridge
-        kernel module override reports rotation=180 to libcamera via
-        SSDB and everything works, but on NixOS the in-tree
-        ipu-bridge can win at modprobe time and the rotation is never
-        reported. This option papers over that by setting
-        `LIBCAMERA_FORCE_OV02E10_ROTATION=180` system-wide.
+        physically mounted inverted.
 
         Strictly opt-in. The env var is only consumed by the libcamera
         bayer-fix patch when the sensor model is exactly `ov02e10`.
@@ -252,180 +288,120 @@ in
     };
   };
 
-  config = lib.mkIf cfg.enable {
-  # OV02E10 (Book5) can show purple/green tint when rotated because the
-  # kernel driver may not update Bayer layout metadata after transform.
-  # Patch libcamera Simple pipeline to recompute Bayer order from transform.
-  # Also install the OV02C10 / OV02E10 sensor color tuning files into
-  # libcamera's IPA simple-pipeline data dir. Without these, libcamera's
-  # software ISP falls back to uncalibrated.yaml (no CCM) and produces a
-  # heavily desaturated, green-tinted image.
-  nixpkgs.overlays = [
-    (final: prev: {
-      libcamera = prev.libcamera.overrideAttrs (old: {
-        patches = (old.patches or [ ]) ++ [
-          ../webcam-fix-book5/libcamera-bayer-fix/bayer-fix-v0.7.patch
+  config = lib.mkMerge [
+    {
+      # Preserve previous behavior: fix on with rotation handling by default.
+      hardware.samsungGalaxyBook.webcamFixBook5.enable = lib.mkDefault true;
+      hardware.samsungGalaxyBook.webcamFixBook5.videoFlip = lib.mkDefault true;
+    }
+    (lib.mkIf cfg.enable {
+      # Intentionally no nixpkgs.overlays here. Upstream patches libcamera
+      # globally, which cascades: libcamera -> pipewire -> sdl2-compat ->
+      # ffmpeg -> qtwebengine/electron (hours of source builds, no binary
+      # cache hit). libcamera-book5 above carries the same bayer-fix patch,
+      # sensor helpers and tuning yamls but is referenced only by the relay,
+      # so system pipewire/ffmpeg stay stock and cached.
+      #
+      # Tradeoff: direct PipeWire-SPA libcamera consumers (GNOME Snapshot,
+      # Firefox PipeWire camera) use stock libcamera. Relay/v4l2loopback
+      # consumers (browsers, Equibop/Discord, Zoom) get the fix.
+
+      boot = {
+        initrd.kernelModules = [
+          "usb_ljca"
+          "gpio_ljca"
+          "intel_cvs"
+          "ipu-bridge"
         ];
 
-        postPatch = (old.postPatch or "") + ''
-          # libcamera 0.7.0 does NOT register CameraSensorHelper for OV02C10
-          # or OV02E10. Without these helpers, IPASoft's auto-exposure falls
-          # back to a generic linear-gain default that fails on these
-          # sensors: apps connect but get no usable frames (or a dim,
-          # washed-out image). The bash installer's
-          # build-patched-libcamera.sh adds them via sed. We mirror that
-          # here as a postPatch so the helpers land in the libcamera
-          # derivation. Both sensors share the same gain model as OV02C10
-          # (gain = value/16), confirmed by the OV02E10 datasheet.
-          HELPER_FILE=""
-          for candidate in src/ipa/libipa/camera_sensor_helper.cpp \
-                           src/libcamera/sensor/camera_sensor_helper.cpp; do
-            if [ -f "$candidate" ]; then
-              HELPER_FILE="$candidate"
-              break
-            fi
-          done
-          if [ -n "$HELPER_FILE" ]; then
-            if ! grep -q 'CameraSensorHelperOv02c10' "$HELPER_FILE"; then
-              sed -i '/#endif.*__DOXYGEN__/i\
-          class CameraSensorHelperOv02c10 : public CameraSensorHelper\
-          {\
-          public:\
-          \tCameraSensorHelperOv02c10()\
-          \t{\
-          \t\tgain_ = AnalogueGainLinear{ 1, 0, 0, 16 };\
-          \t}\
-          };\
-          REGISTER_CAMERA_SENSOR_HELPER("ov02c10", CameraSensorHelperOv02c10)\
-          ' "$HELPER_FILE"
-            fi
-            if ! grep -q 'CameraSensorHelperOv02e10' "$HELPER_FILE"; then
-              sed -i '/#endif.*__DOXYGEN__/i\
-          class CameraSensorHelperOv02e10 : public CameraSensorHelper\
-          {\
-          public:\
-          \tCameraSensorHelperOv02e10()\
-          \t{\
-          \t\tgain_ = AnalogueGainLinear{ 1, 0, 0, 16 };\
-          \t}\
-          };\
-          REGISTER_CAMERA_SENSOR_HELPER("ov02e10", CameraSensorHelperOv02e10)\
-          ' "$HELPER_FILE"
-            fi
-          fi
-        '';
-        postInstall = (old.postInstall or "") + ''
-          install -Dm644 ${../webcam-fix-book5/ov02c10.yaml} \
-            $out/share/libcamera/ipa/simple/ov02c10.yaml
-          install -Dm644 ${../webcam-fix-book5/ov02e10.yaml} \
-            $out/share/libcamera/ipa/simple/ov02e10.yaml
-        '';
-      });
+        kernelModules = [
+          "usb_ljca"
+          "gpio_ljca"
+          "intel_cvs"
+          "ipu-bridge"
+          "v4l2loopback"
+        ];
+
+        extraModulePackages = [
+          intelCvsModule
+          ipuBridgeModule
+          kernelPackages.v4l2loopback
+        ];
+      };
+
+      environment = {
+        systemPackages = [cameraRelay];
+
+        sessionVariables =
+          {
+            LIBCAMERA_IPA_MODULE_PATH = "${libcamera-book5}/lib/libcamera/ipa";
+          }
+          // lib.optionalAttrs cfg.videoFlip {
+            LIBCAMERA_FORCE_OV02E10_ROTATION = "180";
+          };
+
+        etc =
+          {
+            "modules-load.d/intel-ipu7-camera.conf".text = ''
+              # IPU7 camera module chain for Lunar Lake
+              # LJCA provides GPIO/USB control for the vision subsystem
+              usb_ljca
+              gpio_ljca
+              # Intel Computer Vision Subsystem, powers the camera sensor
+              intel_cvs
+            '';
+
+            "modprobe.d/intel-ipu7-camera.conf".text = ''
+              # Ensure LJCA and intel_cvs are loaded before the camera sensor probes.
+              # Without this, the sensor may fail to bind on boot.
+              # LJCA (GPIO/USB) -> intel_cvs (CVS) -> sensor
+              softdep intel_cvs pre: usb_ljca gpio_ljca
+              softdep ov02c10 pre: intel_cvs usb_ljca gpio_ljca
+              softdep ov02e10 pre: intel_cvs usb_ljca gpio_ljca
+            '';
+
+            "modprobe.d/99-camera-relay-loopback.conf".text = ''
+              options v4l2loopback devices=1 exclusive_caps=0 card_label="Built-in Front Camera"
+            '';
+          }
+          // lib.optionalAttrs wireplumberUsesConf {
+            "wireplumber/wireplumber.conf.d/50-disable-ipu7-v4l2.conf".text = wireplumberConfRule;
+          }
+          // lib.optionalAttrs (!wireplumberUsesConf) {
+            "wireplumber/main.lua.d/51-disable-ipu7-v4l2.lua".text = wireplumberLuaRule;
+          };
+      };
+
+      systemd.user.services = {
+        camera-relay = {
+          description = "Camera Relay (on-demand libcamera to v4l2loopback)";
+          after = ["pipewire.service" "wireplumber.service"];
+          wantedBy = ["default.target"];
+          serviceConfig = {
+            Type = "simple";
+            ExecStart = "${cameraRelay}/bin/camera-relay start --on-demand";
+            ExecStop = "${cameraRelay}/bin/camera-relay stop";
+            Restart = "on-failure";
+            RestartSec = 5;
+          };
+          environment =
+            cameraRelayServiceEnvironment
+            // lib.optionalAttrs cfg.videoFlip {
+              LIBCAMERA_FORCE_OV02E10_ROTATION = "180";
+            }
+            // lib.optionalAttrs (cfg.relayColorFilter != "") {
+              RELAY_COLOR_FILTER = cfg.relayColorFilter;
+            };
+        };
+
+        pipewire.environment = lib.optionalAttrs cfg.videoFlip {
+          LIBCAMERA_FORCE_OV02E10_ROTATION = "180";
+        };
+
+        wireplumber.environment = lib.optionalAttrs cfg.videoFlip {
+          LIBCAMERA_FORCE_OV02E10_ROTATION = "180";
+        };
+      };
     })
-  ] ++ lib.optional (cfg.nixpkgsUnpatched != null) (
-    # Pin pipewire to the unpatched base to stop the libcamera overlay from
-    # cascading through the Nix fixed-point into every libpipewire consumer.
-    # prev.pipewire inside an overlay is already tainted (it evaluates with
-    # final.libcamera), so the only escape is a truly overlay-free package set.
-    _: _: {pipewire = cfg.nixpkgsUnpatched.pipewire;}
-  );
-
-  boot = {
-    initrd.kernelModules = [
-      "usb_ljca"
-      "gpio_ljca"
-      "intel_cvs"
-      "ipu-bridge"
-    ];
-
-    kernelModules = [
-      "usb_ljca"
-      "gpio_ljca"
-      "intel_cvs"
-      "ipu-bridge"
-      "v4l2loopback"
-    ];
-
-    extraModulePackages = [
-      intelCvsModule
-      ipuBridgeModule
-      kernelPackages.v4l2loopback
-    ];
-  };
-
-  environment = {
-    systemPackages = [ cameraRelay ];
-
-    sessionVariables = {
-      LIBCAMERA_IPA_MODULE_PATH = "${pkgs.libcamera}/lib/libcamera/ipa";
-    } // lib.optionalAttrs cfg.videoFlip {
-      # Consumed by the bundled libcamera bayer-fix patch only when sensor
-      # model is exactly "ov02e10", strict opt-in with no effect on other
-      # sensors or systems where the env var isn't set.
-      LIBCAMERA_FORCE_OV02E10_ROTATION = "180";
-    };
-
-    etc = {
-    "modules-load.d/intel-ipu7-camera.conf".text = ''
-      # IPU7 camera module chain for Lunar Lake
-      # LJCA provides GPIO/USB control for the vision subsystem
-      usb_ljca
-      gpio_ljca
-      # Intel Computer Vision Subsystem, powers the camera sensor
-      intel_cvs
-    '';
-
-    "modprobe.d/intel-ipu7-camera.conf".text = ''
-      # Ensure LJCA and intel_cvs are loaded before the camera sensor probes.
-      # Without this, the sensor may fail to bind on boot.
-      # LJCA (GPIO/USB) -> intel_cvs (CVS) -> sensor
-      softdep intel_cvs pre: usb_ljca gpio_ljca
-      softdep ov02c10 pre: intel_cvs usb_ljca gpio_ljca
-      softdep ov02e10 pre: intel_cvs usb_ljca gpio_ljca
-    '';
-
-    "modprobe.d/99-camera-relay-loopback.conf".text = ''
-      options v4l2loopback devices=1 exclusive_caps=0 card_label="Built-in Front Camera"
-    '';
-  } // lib.optionalAttrs wireplumberUsesConf {
-    "wireplumber/wireplumber.conf.d/50-disable-ipu7-v4l2.conf".text = wireplumberConfRule;
-  } // lib.optionalAttrs (!wireplumberUsesConf) {
-    "wireplumber/main.lua.d/51-disable-ipu7-v4l2.lua".text = wireplumberLuaRule;
-  };
-  };
-
-  systemd.user.services = {
-    camera-relay = {
-      description = "Camera Relay (on-demand libcamera to v4l2loopback)";
-      after = [ "pipewire.service" "wireplumber.service" ];
-      wantedBy = [ "default.target" ];
-      serviceConfig = {
-        Type = "simple";
-        ExecStart = "${cameraRelay}/bin/camera-relay start --on-demand";
-        ExecStop = "${cameraRelay}/bin/camera-relay stop";
-        Restart = "on-failure";
-        RestartSec = 5;
-      };
-      environment = cameraRelayServiceEnvironment // lib.optionalAttrs cfg.videoFlip {
-        LIBCAMERA_FORCE_OV02E10_ROTATION = "180";
-      } // lib.optionalAttrs (cfg.relayColorFilter != "") {
-        RELAY_COLOR_FILTER = cfg.relayColorFilter;
-      };
-    };
-
-    # Also push LIBCAMERA_FORCE_OV02E10_ROTATION onto PipeWire/WirePlumber so
-    # libcamera-direct apps (Firefox with PipeWire WebRTC, GNOME Snapshot,
-    # etc.) get the rotation override. environment.sessionVariables flows
-    # to user systemd via PAM session import on next login, but explicit
-    # service env makes the fix take effect immediately after rebuild +
-    # `systemctl --user restart pipewire wireplumber`.
-    pipewire.environment = lib.optionalAttrs cfg.videoFlip {
-      LIBCAMERA_FORCE_OV02E10_ROTATION = "180";
-    };
-
-    wireplumber.environment = lib.optionalAttrs cfg.videoFlip {
-      LIBCAMERA_FORCE_OV02E10_ROTATION = "180";
-    };
-  };
-  };
+  ];
 }

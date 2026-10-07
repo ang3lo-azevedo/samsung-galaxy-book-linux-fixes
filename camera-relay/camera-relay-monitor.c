@@ -278,12 +278,24 @@ static void drain_usage_events(int fd, int *streaming)
 	}
 }
 
-/* Read exactly n bytes from fd. Returns n on success, <n on EOF/error.
+/* read_full() result when the pipe stayed silent for READ_SILENT_POLLS
+ * polls (1s) before the first byte of a frame arrived. */
+#define READ_SILENT (-1)
+#define READ_SILENT_POLLS 10
+
+/* A pipeline that stays silent this long is treated as dead. Startup
+ * takes 2-3s, so this only trips on a real stall: a failed suspend can
+ * leave libcamerasrc holding the sensor without delivering frames. */
+#define STALL_SECS 10
+
+/* Read exactly n bytes from fd. Returns n on success, <n on EOF/error,
+ * READ_SILENT if nothing arrived for a second.
  * Uses a 100ms poll timeout to pump black frames to out_fd if the pipe
  * is silent (e.g. during pipeline startup). */
 static int read_full(int fd, char *buf, int n, int out_fd, const char *black_frame)
 {
 	int total = 0;
+	int silent = 0;
 	while (total < n) {
 		struct pollfd pfd = { .fd = fd, .events = POLLIN };
 		/* 100ms timeout safely covers the 166ms OBS select() timeout without
@@ -297,6 +309,10 @@ static int read_full(int fd, char *buf, int n, int out_fd, const char *black_fra
 					(void)w; /* Best effort pump, ignore errors/partials */
 				}
 			}
+			/* Hand control back so the caller can still count
+			 * clients while the pipeline produces nothing. */
+			if (++silent >= READ_SILENT_POLLS)
+				return total == 0 ? READ_SILENT : total;
 			continue;
 		}
 		if (ret < 0) {
@@ -310,6 +326,7 @@ static int read_full(int fd, char *buf, int n, int out_fd, const char *black_fra
 			return total;  /* EOF or error */
 		}
 		total += r;
+		silent = 0;
 	}
 	return total;
 }
@@ -651,14 +668,28 @@ int main(int argc, char *argv[])
 			 * select timeout) alive during the 2-3s pipeline startup
 			 * without causing stutter during normal 30fps streaming.
 			 * If the pipeline dies, read_full returns short and we
-			 * handle it below.
+			 * handle it below. If it goes silent, read_full returns
+			 * READ_SILENT once a second so the client check still
+			 * runs and the sensor is released.
 			 */
+			static int silent_secs = 0;
+
 			int n = read_full(pipe_fd, frame_buf,
 					  frame_size, fd, black_frame);
 			if (n == frame_size) {
 				(void)!write(fd, frame_buf,
 					     frame_size);
 				rapid_fails = 0;
+				silent_secs = 0;
+			} else if (n == READ_SILENT &&
+				   ++silent_secs < STALL_SECS) {
+				/* Nothing to relay yet. */
+			} else if (n == READ_SILENT) {
+				fprintf(stderr,
+					"[monitor] Pipeline stalled"
+					" (no frames for %ds)\n",
+					silent_secs);
+				need_stop = 1;
 			} else {
 				fprintf(stderr,
 					"[monitor] Pipeline"
@@ -670,13 +701,15 @@ int main(int argc, char *argv[])
 
 			/*
 			 * Check client count via /proc every ~1 second.
-			 * At ~30fps, check every 30th frame.
+			 * At ~30fps, check every 30th frame, or on every
+			 * silent second.
 			 */
 			static int check_tick = 0;
 			static int idle_ticks = 0;
 			static int had_clients = 0;
 
-			if (!need_stop && ++check_tick % 30 == 0) {
+			if (!need_stop && (n == READ_SILENT ||
+					   ++check_tick % 30 == 0)) {
 				if (use_events)
 					drain_usage_events(fd,
 						&reader_streaming);
@@ -719,6 +752,7 @@ int main(int argc, char *argv[])
 				check_tick = 0;
 				idle_ticks = 0;
 				had_clients = 0;
+				silent_secs = 0;
 				prev_clients = 0;
 				printf("STOP\n");
 

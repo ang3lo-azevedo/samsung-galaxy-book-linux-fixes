@@ -870,6 +870,14 @@ if [[ -n "$TUNING_DIR" ]]; then
     if [[ -n "${LIBCAMERA_MINOR:-}" ]] && [[ "${LIBCAMERA_MINOR}" -lt 6 ]] 2>/dev/null; then
         TUNING_SRC="$SCRIPT_DIR/${TUNING_SENSOR}-0.5.2.yaml"
         TUNING_VER="v0.5.x (Lut)"
+    elif grep -qas exposureTarget /usr/lib64/libcamera/ipa/ipa_soft_simple.so \
+            /usr/lib/x86_64-linux-gnu/libcamera/ipa/ipa_soft_simple.so /usr/lib/libcamera/ipa/ipa_soft_simple.so \
+            /usr/local/lib*/libcamera/ipa/ipa_soft_simple.so /usr/local/lib/*/libcamera/ipa/ipa_soft_simple.so \
+         && [[ -f "$SCRIPT_DIR/${TUNING_SENSOR}-0.7.2.yaml" ]]; then
+        # libcamera 0.7.2 built with the SoftISP tuning patches (bayer-fix step 4c)
+        TUNING_SRC="$SCRIPT_DIR/${TUNING_SENSOR}-0.7.2.yaml"
+        TUNING_VER="v0.7.2 + SoftISP tuning patches"
+        TUNING_PATCHED=true
     else
         TUNING_SRC="$SCRIPT_DIR/${TUNING_SENSOR}.yaml"
         TUNING_VER="v0.6+ (Adjust)"
@@ -879,7 +887,13 @@ if [[ -n "$TUNING_DIR" ]]; then
         sudo cp "$TUNING_SRC" "$TUNING_DIR/$TUNING_FILE"
         echo "  ✓ Installed $TUNING_FILE → $TUNING_DIR/ ($TUNING_VER)"
         echo "    (CCM tuned by david-bartlett on Galaxy Book5 Pro)"
-        echo "    Use ./tune-ccm.sh to interactively find the best color preset"
+        if [[ "${TUNING_PATCHED:-false}" == "true" ]]; then
+            # tune-ccm.sh presets are measured on stock statistics and have no
+            # exposureTarget or 4096 black level, so don't suggest them here.
+            echo "    Matched to the SoftISP tuning patches: tune-ccm.sh presets don't apply"
+        else
+            echo "    Use ./tune-ccm.sh to interactively find the best color preset"
+        fi
     else
         echo "  ⚠ Tuning file $TUNING_SRC not found in installer directory"
     fi
@@ -1101,7 +1115,23 @@ EOF
     if [[ -f "$RELAY_DIR/camera-relay-monitor.c" ]]; then
         echo "  Building on-demand monitor..."
         if gcc -O2 -Wall -o /tmp/camera-relay-monitor "$RELAY_DIR/camera-relay-monitor.c"; then
-            sudo cp /tmp/camera-relay-monitor /usr/local/bin/camera-relay-monitor
+            # Stop the running monitor before replacing it, or the relay keeps
+            # running the old binary until the next login. Match the command
+            # line anchored on the installed path, not `pgrep -x`: the kernel cuts
+            # comm to 15 characters ("camera-relay-mo"), so -x can never match it.
+            # The anchor keeps it off anything that merely mentions the path
+            # (gcc, editors, this shell).
+            _monitor_re='^/usr/local/bin/camera-relay-monitor( |$)'
+            if pgrep -f "$_monitor_re" >/dev/null 2>&1; then
+                echo "  Stopping the running camera relay to replace the monitor..."
+                systemctl --user stop camera-relay.service 2>/dev/null || true
+                pkill -f "$_monitor_re" 2>/dev/null || true
+                sleep 1
+                _relay_stopped=1
+            fi
+            # install(1), not cp: cp writes into the running binary in place and
+            # fails with "Text file busy", which set -e turns into an aborted install.
+            sudo install -m 755 /tmp/camera-relay-monitor /usr/local/bin/camera-relay-monitor
             sudo chmod 755 /usr/local/bin/camera-relay-monitor
             rm -f /tmp/camera-relay-monitor
             echo "  ✓ Installed /usr/local/bin/camera-relay-monitor"
@@ -1197,6 +1227,12 @@ EOF
     /usr/local/bin/camera-relay enable-persistent --yes 2>/dev/null && \
         echo "  ✓ On-demand relay enabled (near-zero idle CPU)" || \
         echo "  ⚠ Could not enable persistent relay — run 'camera-relay enable-persistent' after reboot"
+
+    # enable-persistent is a no-op when the unit is already enabled and
+    # unchanged, so bring back the relay the monitor replacement stopped.
+    if [[ "${_relay_stopped:-0}" == 1 ]]; then
+        systemctl --user start camera-relay.service 2>/dev/null || true
+    fi
 
     if [[ -n "$_relay_user" ]]; then
         ICON_DEST="${_relay_home}/.local/share/icons/hicolor/symbolic/apps"

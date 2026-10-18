@@ -45,6 +45,77 @@ fi
 
 REAL_USER="${SUDO_USER:-$USER}"
 
+# ─── Uninstall helpers ───────────────────────────────────────────────
+# True if a distro package owns PATH.
+pkg_owns() {
+    local f="$1"
+    if command -v dpkg-query &>/dev/null && dpkg-query -S "$f" &>/dev/null; then return 0; fi
+    if command -v rpm &>/dev/null && rpm -qf "$f" &>/dev/null; then return 0; fi
+    if command -v pacman &>/dev/null && pacman -Qqo "$f" &>/dev/null; then return 0; fi
+    return 1
+}
+
+# True if the backed-up libcamera came from the package manager (not a
+# source build in /usr/local), judged by its libraries.
+libcamera_pkg_managed() {
+    local f
+    while IFS= read -r f; do
+        pkg_owns "${f#"$BACKUP_DIR"}" && return 0
+    done < <(find "$BACKUP_DIR" -name 'libcamera*.so*' \( -type f -o -type l \) 2>/dev/null)
+    return 1
+}
+
+# Remove files the full install added that weren't there before and that no
+# package owns. When the build is a different version from the distro's (e.g.
+# 0.7.0 built as v0.7.2, issue #71), the new libcamera*.so.X.Y.Z sit next to
+# the distro's and ldconfig keeps picking them, so restoring the backup alone
+# leaves the patched library loaded against the stock IPA.
+remove_unowned_installed_files() {
+    local list="$BACKUP_DIR/install-log.txt" f d n=0
+    local -a files=() dirs=()
+    if [[ -f "$list" ]]; then
+        mapfile -t files < <(grep -v '^#' "$list")
+    else
+        # Backups made before the install log was kept: catch the libraries.
+        mapfile -t dirs < <(find "$BACKUP_DIR" -name 'libcamera*.so*' -printf '%h\n' 2>/dev/null | sort -u)
+        for d in "${dirs[@]}"; do
+            files+=("${d#"$BACKUP_DIR"}"/libcamera*.so*)
+        done
+    fi
+    for f in "${files[@]}"; do
+        [[ -n "$f" ]] || continue
+        [[ -e "$f" || -L "$f" ]] || continue
+        [[ -d "$f" && ! -L "$f" ]] && continue
+        [[ -e "$BACKUP_DIR$f" || -L "$BACKUP_DIR$f" ]] && continue   # existed before: restored below
+        pkg_owns "$f" && continue
+        rm -f "$f" && info "  Removed: $f" && n=$((n + 1))
+    done
+    # Drop libcamera directories the install created and left empty
+    while IFS= read -r d; do
+        while [[ "$d" == *libcamera* && -d "$d" ]] && rmdir "$d" 2>/dev/null; do
+            d="$(dirname "$d")"
+        done
+    done < <(printf '%s\n' "${files[@]}" | xargs -r -n1 dirname | sort -ru)
+    info "Removed $n file(s) added by the patched build."
+}
+
+# Reinstall the libcamera packages that are installed, to put back files the
+# backup doesn't cover (e.g. the GStreamer plugin).
+reinstall_distro_libcamera() {
+    local -a pkgs=()
+    if command -v dnf &>/dev/null; then
+        mapfile -t pkgs < <(rpm -qa --qf '%{NAME}\n' 'libcamera*' | sort -u)
+        [[ ${#pkgs[@]} -gt 0 ]] && { dnf reinstall -y "${pkgs[@]}" || warn "dnf reinstall failed — run: sudo dnf reinstall ${pkgs[*]}"; }
+    elif command -v pacman &>/dev/null; then
+        mapfile -t pkgs < <(pacman -Qq | grep -E '^(libcamera|gst-plugin-libcamera)' || true)
+        [[ ${#pkgs[@]} -gt 0 ]] && { pacman -S --noconfirm "${pkgs[@]}" || warn "pacman reinstall failed — run: sudo pacman -S ${pkgs[*]}"; }
+    elif command -v apt-get &>/dev/null; then
+        mapfile -t pkgs < <(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 2>/dev/null | awk '$1 == "ii" && $2 ~ /libcamera/ {print $2}')
+        [[ ${#pkgs[@]} -gt 0 ]] && { apt-get install --reinstall -y "${pkgs[@]}" || warn "apt reinstall failed — run: sudo apt install --reinstall ${pkgs[*]}"; }
+    fi
+    return 0
+}
+
 # ─── Uninstall mode ──────────────────────────────────────────────────
 if [[ "${1:-}" == "--uninstall" ]]; then
     echo ""
@@ -95,16 +166,13 @@ if [[ "${1:-}" == "--uninstall" ]]; then
         warn "libcamera version changed since backup ($BACKUP_VER_CLEAN → $CURRENT_VER_CLEAN)"
         warn "Restoring stale backup would break the system — skipping restore."
         info "Removing stale backup and reinstalling from package manager..."
+        if libcamera_pkg_managed; then
+            remove_unowned_installed_files
+        fi
         rm -rf "$BACKUP_DIR"
 
         # Reinstall from distro package manager
-        if command -v dnf &>/dev/null; then
-            dnf reinstall -y 'libcamera*' 2>/dev/null || true
-        elif command -v pacman &>/dev/null; then
-            pacman -S --noconfirm libcamera libcamera-ipa 2>/dev/null || true
-        elif command -v apt-get &>/dev/null; then
-            apt-get install --reinstall -y 'libcamera*' 2>/dev/null || true
-        fi
+        reinstall_distro_libcamera
 
         ldconfig 2>/dev/null || true
         rm -f /etc/profile.d/libcamera-ipa-path.sh
@@ -113,15 +181,32 @@ if [[ "${1:-}" == "--uninstall" ]]; then
         exit 0
     fi
 
+    PKG_MANAGED=false
+    libcamera_pkg_managed && PKG_MANAGED=true
+    if $PKG_MANAGED; then
+        info "Removing files added by the patched build..."
+        remove_unowned_installed_files
+    fi
+
     info "Restoring original libcamera files (version: ${BACKUP_VERSION:-unknown})..."
     while IFS= read -r backup_file; do
         rel_path="${backup_file#$BACKUP_DIR}"
-        # Skip the version marker file
+        # Skip the version marker and the install log
         [[ "$backup_file" == "$BACKUP_DIR/version" ]] && continue
-        if [[ -f "$backup_file" ]]; then
+        [[ "$backup_file" == "$BACKUP_DIR/install-log.txt" ]] && continue
+        if [[ -L "$backup_file" ]]; then
+            # Symlinks too: e.g. libcamera.so.0.7 -> libcamera.so.0.7.0
+            ln -sfn "$(readlink "$backup_file")" "$rel_path"
+            echo "'$backup_file' -> '$rel_path' (symlink)"
+        elif [[ -f "$backup_file" ]]; then
             cp -v "$backup_file" "$rel_path"
         fi
-    done < <(find "$BACKUP_DIR" -type f)
+    done < <(find "$BACKUP_DIR" \( -type f -o -type l \))
+
+    if $PKG_MANAGED; then
+        info "Reinstalling distro libcamera packages (restores files not in the backup)..."
+        reinstall_distro_libcamera
+    fi
 
     ldconfig 2>/dev/null || true
     rm -rf "$BACKUP_DIR"
@@ -191,7 +276,7 @@ detect_libcamera_version() {
     fi
 
     if [[ -z "$LIBCAMERA_VERSION" ]]; then
-        die "Cannot detect installed libcamera version. Is libcamera installed?"
+        die "libcamera is not installed. Run install.sh (it installs libcamera first), or install libcamera from your package manager, then re-run this script."
     fi
 
     # Extract version number (e.g., "0.6.0" from "0.6.0+53-f4f8b487-dirty" or "0.6.0-1.fc43")
@@ -362,7 +447,7 @@ find_libcamera_libs() {
     fi
 
     if [[ -z "$LIBCAMERA_LIB_DIR" ]]; then
-        die "Cannot find libcamera.so — is libcamera installed?"
+        die "Cannot find libcamera.so. Run install.sh (it installs libcamera first), or install libcamera from your package manager, then re-run this script."
     fi
 
     # Find IPA module directory (match the lib directory we found)
@@ -704,73 +789,116 @@ mkdir -p "$BUILD_DIR"
 
 USE_SRPM=false
 
-# On Fedora, use SRPM to get distro-patched source (vanilla source may
-# lack distro-specific patches for camera/pipeline support)
-if [[ "$DISTRO" == "fedora" ]]; then
-    info "Fedora detected — downloading source RPM for distro-patched source..."
-
+# Fedora must build from the distro source RPM. Never fall
+# back to a git clone here: with libcamera in /usr/lib64 a clone build takes
+# the libraries-only install in step 8, which leaves the build runpath in
+# libcamera.so. libcamera then thinks it is not installed, looks for the IPA
+# proxy worker in a build tree that no longer exists, and the soft ISP fails
+# (RAW only, no usable webcam). If the source RPM can't be prepared, stop now:
+# nothing has been backed up or replaced yet, so the stock libcamera keeps
+# working (with the purple tint) and install.sh can retry later.
+prepare_srpm_source() {
     SRPM_DIR="$BUILD_DIR/srpmbuild"
-    mkdir -p "$SRPM_DIR"
+    RPM_BUILD="$BUILD_DIR/rpmbuild"
+    mkdir -p "$SRPM_DIR" "$RPM_BUILD"/{SOURCES,SPECS}
 
-    # Download the source RPM
-    if dnf download --source libcamera --destdir "$SRPM_DIR" 2>&1; then
-        SRPM_FILE=$(ls "$SRPM_DIR"/*.src.rpm 2>/dev/null | head -1)
-        if [[ -n "$SRPM_FILE" ]]; then
-            ok "Downloaded: $(basename "$SRPM_FILE")"
-
-            # Extract SRPM
-            RPM_BUILD="$BUILD_DIR/rpmbuild"
-            mkdir -p "$RPM_BUILD"/{SOURCES,SPECS}
-            rpm -i --define "_topdir $RPM_BUILD" "$SRPM_FILE" 2>&1
-
-            # Find the spec file
-            SPEC_FILE=$(ls "$RPM_BUILD/SPECS/"*.spec 2>/dev/null | head -1)
-            if [[ -n "$SPEC_FILE" ]]; then
-                # Prep the source (extract + apply distro patches)
-                info "Preparing source with Fedora patches..."
-                rpmbuild -bp --define "_topdir $RPM_BUILD" "$SPEC_FILE" 2>&1 | tail -10
-
-                # Find the prepared source directory
-                # Try multiple strategies — Fedora may name the dir differently
-                PREPPED_SRC=""
-
-                # Strategy 1: Look for meson.build with project('libcamera')
-                while IFS= read -r meson_file; do
-                    if grep -q "project.*libcamera" "$meson_file" 2>/dev/null; then
-                        PREPPED_SRC="$(dirname "$meson_file")"
-                        break
-                    fi
-                done < <(find "$RPM_BUILD/BUILD" -maxdepth 3 -name "meson.build" 2>/dev/null)
-
-                # Strategy 2: Just grab the first directory in BUILD
-                if [[ -z "$PREPPED_SRC" ]]; then
-                    PREPPED_SRC=$(find "$RPM_BUILD/BUILD" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)
-                fi
-
-                # Debug: show what's in BUILD
-                if [[ -z "$PREPPED_SRC" || ! -d "$PREPPED_SRC" ]]; then
-                    warn "Could not find prepared source. Contents of BUILD dir:"
-                    ls -la "$RPM_BUILD/BUILD/" 2>/dev/null || true
-                    find "$RPM_BUILD/BUILD" -maxdepth 2 -name "meson.build" 2>/dev/null || true
-                    warn "Falling back to git clone."
-                else
-                    info "Found source at: $PREPPED_SRC"
-                    mv "$PREPPED_SRC" "$BUILD_DIR/libcamera"
-                    USE_SRPM=true
-                    ok "Source prepared with Fedora patches."
-                fi
-            else
-                warn "Could not find spec file. Falling back to git clone."
-            fi
-        else
-            warn "No SRPM downloaded. Falling back to git clone."
-        fi
-    else
-        warn "dnf download --source failed. Falling back to git clone."
+    # The exact package that is installed, so the build matches the
+    # libcamera-ipa and rpm database version (and install.sh's version check).
+    local pkg_nvr srpm_name pkg_ver pkg_rel
+    pkg_nvr=$(rpm -q --qf '%{NAME}-%{VERSION}-%{RELEASE}\n' libcamera 2>/dev/null | head -1 || true)
+    srpm_name=$(rpm -q --qf '%{SOURCERPM}\n' libcamera 2>/dev/null | head -1 || true)
+    pkg_ver=$(rpm -q --qf '%{VERSION}\n' libcamera 2>/dev/null | head -1 || true)
+    pkg_rel=$(rpm -q --qf '%{RELEASE}\n' libcamera 2>/dev/null | head -1 || true)
+    if [[ -z "$pkg_nvr" || "$pkg_nvr" == *"not installed"* || "$srpm_name" != *.src.rpm ]]; then
+        error "The libcamera package is not installed from an RPM."
+        return 1
     fi
+    info "Installed package: $pkg_nvr (source: $srpm_name)"
+
+    # 1. dnf from the distro's source repos. dnf5 (Fedora 41+) uses --srpm,
+    #    dnf4 uses --source; try both rather than guess the dnf version.
+    if dnf download --srpm "$pkg_nvr" --destdir "$SRPM_DIR" 2>&1 \
+       || dnf download --source "$pkg_nvr" --destdir "$SRPM_DIR" 2>&1; then
+        :
+    else
+        warn "dnf could not download $srpm_name."
+    fi
+
+    # 2. Fedora's build system keeps every build's source RPM, including
+    #    ones the mirrors have dropped. Only works for Fedora's own builds.
+    if [[ ! -f "$SRPM_DIR/$srpm_name" ]]; then
+        local koji_url="https://kojipkgs.fedoraproject.org/packages/libcamera/$pkg_ver/$pkg_rel/src/$srpm_name"
+        info "Trying Fedora Koji: $koji_url"
+        curl -fsSL --connect-timeout 20 --retry 3 -o "$SRPM_DIR/$srpm_name" "$koji_url" 2>&1 \
+            || { rm -f "$SRPM_DIR/$srpm_name"; warn "Koji download failed."; }
+    fi
+
+    # Only the exact source RPM of the installed package is accepted, never
+    # a different version that happened to be downloaded.
+    local srpm_file="$SRPM_DIR/$srpm_name"
+    if [[ ! -f "$srpm_file" ]]; then
+        error "Could not download the libcamera source RPM ($srpm_name). Check your network."
+        return 1
+    fi
+    ok "Downloaded: $(basename "$srpm_file")"
+
+    if ! rpm -i --define "_topdir $RPM_BUILD" "$srpm_file" 2>&1; then
+        error "Could not unpack $(basename "$srpm_file")."
+        return 1
+    fi
+
+    local spec_file
+    spec_file=$(ls "$RPM_BUILD/SPECS/"*.spec 2>/dev/null | head -1 || true)
+    if [[ -z "$spec_file" ]]; then
+        error "No spec file in $(basename "$srpm_file")."
+        return 1
+    fi
+
+    # Prep only (extract + apply distro patches). --nodeps: %prep doesn't need
+    # the BuildRequires; a missing one shows up clearly at meson setup instead.
+    info "Preparing source with Fedora patches..."
+    local prep_log="$BUILD_DIR/rpmbuild-prep.log"
+    if ! rpmbuild -bp --nodeps --define "_topdir $RPM_BUILD" "$spec_file" >"$prep_log" 2>&1; then
+        tail -20 "$prep_log"
+        error "rpmbuild -bp failed (log: $prep_log)."
+        return 1
+    fi
+
+    # Find the prepared tree: the meson.build that declares project('libcamera').
+    # rpm 4.20+ (Fedora 41+) nests it as BUILD/<name>-build/<name>-<ver>.
+    local prepped_src="" meson_file
+    while IFS= read -r meson_file; do
+        if grep -q "project.*libcamera" "$meson_file" 2>/dev/null; then
+            prepped_src="$(dirname "$meson_file")"
+            break
+        fi
+    done < <(find "$RPM_BUILD/BUILD" -maxdepth 3 -name "meson.build" 2>/dev/null)
+
+    if [[ -z "$prepped_src" || ! -d "$prepped_src" ]]; then
+        error "Could not find the prepared libcamera source. Contents of BUILD dir:"
+        ls -la "$RPM_BUILD/BUILD/" 2>/dev/null || true
+        return 1
+    fi
+
+    info "Found source at: $prepped_src"
+    if ! mv "$prepped_src" "$BUILD_DIR/libcamera"; then
+        error "Could not move the prepared source to $BUILD_DIR/libcamera."
+        return 1
+    fi
+    return 0
+}
+
+if [[ "$DISTRO" == "fedora" ]]; then
+    info "Fedora detected — using the source RPM for the installed libcamera..."
+    if ! prepare_srpm_source; then
+        rm -rf "$BUILD_DIR"
+        die "Could not prepare the Fedora libcamera source RPM (see the error above). Nothing was changed."
+    fi
+    USE_SRPM=true
+    ok "Source prepared with Fedora patches."
 fi
 
-# Fall back to git clone (for non-Fedora or if SRPM approach failed)
+# Non-Fedora distros: build from the upstream git tag
 if [[ "$USE_SRPM" != "true" ]]; then
     info "Cloning libcamera source (${LIBCAMERA_GIT_TAG})..."
 
@@ -850,6 +978,64 @@ else
 fi
 echo ""
 
+# Determine install strategy (used by step 4c and step 8):
+# - SRPM build: full install (distro source, matching signatures)
+# - /usr/local prefix: full install (built from source, no distro packages to preserve)
+# - Distro package paths (/usr/lib*): .so-only install (preserve distro IPA signatures)
+USE_FULL_INSTALL=false
+INSTALL_MODE_MSG=""
+if [[ "$USE_SRPM" == "true" ]]; then
+    USE_FULL_INSTALL=true
+    INSTALL_MODE_MSG="Full install: built from distro source RPM."
+elif [[ "$LIBCAMERA_LIB_DIR" == /usr/local/* ]]; then
+    USE_FULL_INSTALL=true
+    INSTALL_MODE_MSG="Full install: library is in /usr/local (built from source, not distro package)."
+elif [[ "$DISTRO" == "arch" ]]; then
+    # Arch: must use full install. The .so-only approach leaves build-tree
+    # paths embedded in the library (IPA search path becomes //src/ipa)
+    # because meson install is what rewrites the rpath. Arch's IPA signature
+    # checking falls back to non-sandboxed mode when signatures don't match,
+    # so this is safe.
+    USE_FULL_INSTALL=true
+    INSTALL_MODE_MSG="Full install: Arch Linux (so-only install breaks IPA path resolution)."
+elif [[ "$DISTRO" == "debian" || "$DISTRO" == "ubuntu" ]]; then
+    # Ubuntu/Debian: IPA modules must match the patched library's build hash.
+    # The .so-only approach preserves distro IPA .sign files which were built
+    # against the original library — causing signature mismatch and camera failure.
+    USE_FULL_INSTALL=true
+    INSTALL_MODE_MSG="Full install: Ubuntu/Debian (IPA modules must match patched library)."
+fi
+
+# Step 4c: libcamera 0.7.2 only — SoftISP tuning patches from the NixOS module
+# (PR #102). They are cut against 0.7.2 and do not apply to other versions.
+# install.sh selects ov02e10-0.7.2.yaml only when they are in the installed IPA.
+# Full installs only: awb-skip-saturated changes the SwIspStats layout shared by
+# libcamera.so and the IPA, so a .so-only install (distro IPA kept) would pass
+# the stock IPA statistics it misreads, breaking AGC, AWB and black level.
+# Not on a master clone either: master's meson.build can still read 0.7.2, but
+# the patches only apply to the v0.7.2 release.
+SWISP_SRC_VER=$(grep -m1 -oP "^\s*version\s*:\s*'\K[0-9.]+" "$BUILD_DIR/libcamera/meson.build" || true)
+if [[ "$SWISP_SRC_VER" == "0.7.2" && "$USE_SRPM" != "true" && "$LIBCAMERA_GIT_TAG" == "master" ]]; then
+    info "Building libcamera master, not the v0.7.2 release — skipping SoftISP tuning patches."
+    echo ""
+elif [[ "$SWISP_SRC_VER" == "0.7.2" && "$USE_FULL_INSTALL" != "true" ]]; then
+    info "libcamera 0.7.2, but this is a libraries-only install (distro IPA kept)."
+    info "Skipping SoftISP tuning patches: they must be in libcamera.so and the IPA together."
+    echo ""
+elif [[ "$SWISP_SRC_VER" == "0.7.2" ]]; then
+    info "libcamera 0.7.2 — applying SoftISP tuning patches..."
+    cp -a "$BUILD_DIR/libcamera" "$BUILD_DIR/libcamera.orig"
+    if (cd "$BUILD_DIR/libcamera" && for p in blc-channel-levels agc-min-gain-step awb-skip-saturated agc-exposure-target; do
+            git apply "$SCRIPT_DIR/$p.patch" || exit 1; done); then
+        ok "SoftISP tuning patches applied."
+        rm -rf "$BUILD_DIR/libcamera.orig"
+    else
+        warn "SoftISP tuning patches did not apply — building with the bayer fix only."
+        rm -rf "$BUILD_DIR/libcamera" && mv "$BUILD_DIR/libcamera.orig" "$BUILD_DIR/libcamera"
+    fi
+    echo ""
+fi
+
 # Step 5: Verify patch
 info "Verifying patch..."
 if grep -qE 'ispFormat|inputBayer\.order' "$BUILD_DIR/libcamera/src/libcamera/pipeline/simple/simple.cpp"; then
@@ -909,37 +1095,19 @@ echo ""
 
 # Step 8: Install
 cd "$BUILD_DIR/libcamera"
+# Marker for step 9: installs keep the build's modification times, so check
+# change times (which a copy can't keep) against this instead.
+touch "$BUILD_DIR/.install-start"
 
-# Determine install strategy:
-# - SRPM build: full install (distro source, matching signatures)
-# - /usr/local prefix: full install (built from source, no distro packages to preserve)
-# - Distro package paths (/usr/lib*): .so-only install (preserve distro IPA signatures)
-USE_FULL_INSTALL=false
-if [[ "$USE_SRPM" == "true" ]]; then
-    USE_FULL_INSTALL=true
-    info "Full install: built from distro source RPM."
-elif [[ "$LIBCAMERA_LIB_DIR" == /usr/local/* ]]; then
-    USE_FULL_INSTALL=true
-    info "Full install: library is in /usr/local (built from source, not distro package)."
-elif [[ "$DISTRO" == "arch" ]]; then
-    # Arch: must use full install. The .so-only approach leaves build-tree
-    # paths embedded in the library (IPA search path becomes //src/ipa)
-    # because meson install is what rewrites the rpath. Arch's IPA signature
-    # checking falls back to non-sandboxed mode when signatures don't match,
-    # so this is safe.
-    USE_FULL_INSTALL=true
-    info "Full install: Arch Linux (so-only install breaks IPA path resolution)."
-elif [[ "$DISTRO" == "debian" || "$DISTRO" == "ubuntu" ]]; then
-    # Ubuntu/Debian: IPA modules must match the patched library's build hash.
-    # The .so-only approach preserves distro IPA .sign files which were built
-    # against the original library — causing signature mismatch and camera failure.
-    USE_FULL_INSTALL=true
-    info "Full install: Ubuntu/Debian (IPA modules must match patched library)."
-fi
+# Install strategy (USE_FULL_INSTALL) was decided before step 4c.
+[[ -n "$INSTALL_MODE_MSG" ]] && info "$INSTALL_MODE_MSG"
 
 if [[ "$USE_FULL_INSTALL" == "true" ]]; then
     info "Installing patched libcamera (full install)..."
     ninja -C builddir install 2>&1 | tail -10
+    # Keep meson's list of installed files so --uninstall can remove the ones
+    # that weren't there before (see remove_unowned_installed_files).
+    cp builddir/meson-logs/install-log.txt "$BACKUP_DIR/install-log.txt" 2>/dev/null || true
     ldconfig 2>/dev/null || true
     ok "Patched libcamera installed (full install)."
 else
@@ -989,6 +1157,7 @@ else
     if [[ $INSTALLED_COUNT -eq 0 ]]; then
         warn "No .so files were replaced. Falling back to full install..."
         ninja -C builddir install 2>&1 | tail -10
+        cp builddir/meson-logs/install-log.txt "$BACKUP_DIR/install-log.txt" 2>/dev/null || true
     fi
 
     ldconfig 2>/dev/null || true
@@ -1011,9 +1180,11 @@ echo ""
 
 # Step 9: Verify installation
 info "Verifying installation..."
-INSTALLED_LIB=$(find "$LIBCAMERA_LIB_DIR" -name 'libcamera.so.*' -newer "$BACKUP_DIR" -print -quit 2>/dev/null || true)
+# -H: the library folder can be a symlink (/lib64 on Fedora). -type f: the
+# library itself, not one of its symlinks.
+INSTALLED_LIB=$(find -H "$LIBCAMERA_LIB_DIR" -name 'libcamera.so.*' -type f -cnewer "$BUILD_DIR/.install-start" -print -quit 2>/dev/null || true)
 if [[ -n "$INSTALLED_LIB" ]]; then
-    ok "Verified: $INSTALLED_LIB is newer than backup."
+    ok "Verified: $INSTALLED_LIB was installed by this run."
 else
     warn "Could not verify installation timestamp. Library may need ldconfig."
 fi

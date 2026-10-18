@@ -84,6 +84,8 @@
           $out/share/libcamera/ipa/simple/ov02c10.yaml
         install -Dm644 ${./ov02e10.yaml} \
           $out/share/libcamera/ipa/simple/ov02e10.yaml
+        substituteInPlace $out/share/libcamera/ipa/simple/ov02e10.yaml \
+          --replace-fail "exposureTarget: 1.5" "exposureTarget: ${toString cfg.exposureTarget}"
       ''
       # Per-channel pedestals as offset + slope * analogue gain, fitted from
       # covered-lens raw frames at 1x-4x with dgain=1020 (960XHA). The sensor
@@ -308,6 +310,48 @@
     };
   };
 
+  cameraRelaySystray = pkgs.stdenvNoCC.mkDerivation {
+    pname = "camera-relay-systray";
+    version = "1.0";
+
+    src = ../camera-relay;
+
+    nativeBuildInputs = [pkgs.wrapGAppsHook3 pkgs.gobject-introspection];
+    buildInputs = [
+      pkgs.gtk3
+      pkgs.libayatana-appindicator
+      (pkgs.python3.withPackages (ps: [ps.pygobject3]))
+    ];
+
+    dontConfigure = true;
+    dontBuild = true;
+
+    # Persistence is the camera-relay user unit declared below. The tray's
+    # persistent toggles would write a second unit to ~/.config/systemd/user
+    # and cannot disable the NixOS one, so they are left out of the menu.
+    postPatch = ''
+      substituteInPlace camera-relay-systray.py \
+        --replace-fail 'RELAY_CMD = "/usr/local/bin/camera-relay"' \
+                       'RELAY_CMD = "${cameraRelay}/bin/camera-relay"' \
+        --replace-fail ${lib.escapeShellArg "        menu.append(self.item_persistent)\n\n        menu.append(Gtk.SeparatorMenuItem())\n"} "" \
+        --replace-fail ${lib.escapeShellArg "        menu.append(item_disable_hide)\n"} ""
+    '';
+
+    installPhase = ''
+      runHook preInstall
+      install -Dm755 camera-relay-systray.py $out/bin/camera-relay-systray
+      install -Dm644 -t $out/share/icons/hicolor/symbolic/apps yaru-icons/*.svg
+      runHook postInstall
+    '';
+
+    meta = with lib; {
+      description = "Tray indicator for the Samsung Galaxy Book5 camera relay";
+      license = licenses.gpl2Only;
+      platforms = platforms.linux;
+      mainProgram = "camera-relay-systray";
+    };
+  };
+
   cameraRelayServiceEnvironment = {
     LIBCAMERA_IPA_MODULE_PATH = "${libcamera-book5}/lib/libcamera/ipa";
     GST_PLUGIN_SYSTEM_PATH_1_0 = lib.makeSearchPath "lib/gstreamer-1.0" (map lib.getLib [
@@ -416,6 +460,24 @@ in {
       '';
     };
 
+    exposureTarget = lib.mkOption {
+      type = lib.types.numbers.between 1 5;
+      default = 1.5;
+      example = 1.7;
+      description = ''
+        Mean sample value the OV02E10 AGC aims for, on libcamera's 1-5 scale.
+        Higher is brighter. The shell installer's ov02e10-0.7.2.yaml uses 1.7
+        because 1.5 looked too dark next to a bright window.
+      '';
+    };
+
+    systray.enable = lib.mkEnableOption ''
+      the Camera Relay tray indicator, started with the graphical session.
+      It shows whether the relay is idle or streaming and can start or stop
+      it. Needs a StatusNotifierItem tray (KDE, waybar, GNOME with the
+      AppIndicator extension)
+    '';
+
     lowNoise = {
       enable = lib.mkEnableOption ''
         the OV02E10 low-noise driver, which caps analog gain and makes up the
@@ -502,7 +564,9 @@ in {
       };
 
       environment = {
-        systemPackages = [cameraRelay];
+        # The tray host looks its icons up by name, so they have to be in
+        # the system profile rather than only inside the tray's own wrapper.
+        systemPackages = [cameraRelay] ++ lib.optional cfg.systray.enable cameraRelaySystray;
 
         # No LIBCAMERA_IPA_MODULE_PATH in the session: the patched IPA shares
         # a changed SwIspStats layout with its own libcamera.so, so a stock
@@ -570,6 +634,18 @@ in {
             // lib.optionalAttrs (cfg.relayColorFilter != "") {
               RELAY_COLOR_FILTER = cfg.relayColorFilter;
             };
+        };
+
+        camera-relay-systray = lib.mkIf cfg.systray.enable {
+          description = "Camera Relay tray indicator";
+          partOf = ["graphical-session.target"];
+          after = ["graphical-session.target" "camera-relay.service"];
+          wantedBy = ["graphical-session.target"];
+          serviceConfig = {
+            ExecStart = lib.getExe cameraRelaySystray;
+            Restart = "on-failure";
+            RestartSec = 5;
+          };
         };
       };
   };

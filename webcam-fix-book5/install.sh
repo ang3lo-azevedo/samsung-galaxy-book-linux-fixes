@@ -32,12 +32,53 @@ SRC_DIR="/usr/src/vision-driver-${VISION_DRIVER_VER}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Installed libcamera version, for the bayer-fix rebuild check (step 8).
+# Keep these two helpers byte-identical with
+# libcamera-bayer-fix/build-patched-libcamera.sh
+# (camera-relay/tests/test-libcamera-version-detect.sh checks it).
+#
+# Prints the installed libcamera version as x.y.z: the newer of pkg-config
+# and the package manager, or nothing if neither knows one. pkg-config alone
+# loses to a stale dev package (Debian stable's libcamera-dev 0.4.0 next to a
+# 0.7.1 backport, issue #119); the package manager alone misses /usr/local
+# builds and the .pc our own full install writes.
+libcamera_installed_version() {
+    local pc="" pkg=""
+    if command -v pkg-config &>/dev/null; then
+        pc=$(pkg-config --modversion libcamera 2>/dev/null || true)
+    fi
+    if command -v dpkg &>/dev/null; then
+        pkg=$(dpkg -l 'libcamera*' 2>/dev/null | awk '/^ii.*libcamera0/ {print $3}' | sort -V | tail -1 || true)
+    fi
+    if [[ -z "$pkg" ]] && command -v rpm &>/dev/null; then
+        pkg=$(rpm -q --qf '%{VERSION}' libcamera 2>/dev/null || true)
+        [[ "$pkg" == *"not installed"* ]] && pkg=""
+    fi
+    if [[ -z "$pkg" ]] && command -v pacman &>/dev/null; then
+        pkg=$(pacman -Q libcamera 2>/dev/null | awk '{print $2}' || true)
+    fi
+    # Strip an epoch ("1:") and anything after x.y.z ("-1~bpo13+1", "+53-f4f8b487")
+    pc=$(echo "$pc" | grep -oP '^(\d+:)?\K\d+\.\d+\.\d+' || true)
+    pkg=$(echo "$pkg" | grep -oP '^(\d+:)?\K\d+\.\d+\.\d+' || true)
+    printf '%s\n' "$pc" "$pkg" | sort -V | tail -1
+}
+
+# Prints the version we actually build for distro version $1: 0.7.0 becomes
+# 0.7.2 (its SoftISP auto-exposure bug, issue #71), anything else is unchanged.
+floor_libcamera_version() {
+    if [[ "${1:-}" == "0.7.0" ]]; then
+        echo "0.7.2"
+    else
+        echo "${1:-}"
+    fi
+}
+
 FORCE=false
 [ "$1" = "--force" ] && FORCE=true
 
 echo "=============================================="
 echo "  Samsung Galaxy Book5 Webcam Fix"
-echo "  Arch / Fedora / Ubuntu — Lunar Lake (IPU7)"
+echo "  Arch / Fedora / Debian / Ubuntu — Lunar Lake (IPU7)"
 echo "=============================================="
 echo ""
 
@@ -71,17 +112,29 @@ elif command -v dnf >/dev/null 2>&1; then
     fi
 elif command -v apt >/dev/null 2>&1; then
     DISTRO="ubuntu"
-    # Ubuntu doesn't ship libcamera 0.5.2+ (needed for IPU7) in its repos.
-    # But users who build libcamera from source can still use this script.
+    # DISTRO stays "ubuntu" for every apt system — the apt paths below are the
+    # same on Debian. DISTRO_LABEL and IS_DEBIAN only change what we print.
+    # os-release is read in subshells so its variables can't leak into ours.
+    DISTRO_LABEL=$( . /etc/os-release 2>/dev/null || true; echo "${PRETTY_NAME:-${NAME:-}}" )
+    [[ -n "$DISTRO_LABEL" ]] || DISTRO_LABEL="Debian/Ubuntu"
+    IS_DEBIAN=$( . /etc/os-release 2>/dev/null || true
+        if [[ "${ID:-}" == "debian" ]] || { [[ " ${ID_LIKE:-} " == *" debian "* ]] && [[ " ${ID:-} ${ID_LIKE:-} " != *" ubuntu "* ]]; }; then
+            echo true
+        else
+            echo false
+        fi )
+    # IPU7 needs libcamera 0.5.2+. Some repos ship it (Ubuntu 26.04, Debian 13
+    # trixie-backports); otherwise it has to be built from source.
     # Note: cam --version doesn't exist in all libcamera versions (e.g. 0.7.0).
     # Use the libcamera.so symlink version instead.
     LIBCAMERA_VER=$(ls -l /usr/local/lib/*/libcamera.so.* /usr/local/lib/libcamera.so.* /usr/lib/*/libcamera.so.* /usr/lib/libcamera.so.* 2>/dev/null \
         | grep -oP 'libcamera\.so\.\K[0-9]+\.[0-9]+' | sort -V | tail -1 || true)
     if [[ -z "$LIBCAMERA_VER" ]]; then
-        echo "ERROR: Ubuntu detected but libcamera is not installed."
+        echo "ERROR: ${DISTRO_LABEL} detected but libcamera is not installed."
         echo ""
-        echo "       Ubuntu's repos ship libcamera 0.2.x which does NOT support IPU7."
-        echo "       You need libcamera 0.5.2+ built from source."
+        echo "       IPU7 needs libcamera 0.5.2+. Some repos ship it (Ubuntu 26.04 has"
+        echo "       0.7.0, Debian 13 trixie-backports has 0.7.1); otherwise build it"
+        echo "       from source."
         echo ""
         echo "       Build instructions: https://libcamera.org/getting-started.html"
         echo "       Reference: https://wiki.archlinux.org/title/Dell_XPS_13_(9350)_2024#Camera"
@@ -92,10 +145,10 @@ elif command -v apt >/dev/null 2>&1; then
     fi
     LIBCAMERA_MAJOR=$(echo "$LIBCAMERA_VER" | cut -d. -f1)
     LIBCAMERA_MINOR=$(echo "$LIBCAMERA_VER" | cut -d. -f2)
-    echo "  ✓ Ubuntu detected with libcamera ${LIBCAMERA_VER}"
-    echo "  ⚠ Ubuntu support is experimental — libcamera was not installed from repos"
+    echo "  ✓ ${DISTRO_LABEL} detected with libcamera ${LIBCAMERA_VER}"
+    echo "  ⚠ Debian/Ubuntu support is experimental"
 else
-    echo "ERROR: Unsupported distro. This script requires pacman (Arch), dnf (Fedora), or apt (Ubuntu)."
+    echo "ERROR: Unsupported distro. This script requires pacman (Arch), dnf (Fedora), or apt (Debian/Ubuntu)."
     exit 1
 fi
 
@@ -170,6 +223,9 @@ if [[ "$KMAJOR" -lt 6 ]] || { [[ "$KMAJOR" -eq 6 ]] && [[ "$KMINOR" -lt 17 ]]; }
         echo "       Update your kernel: sudo pacman -Syu"
     elif [[ "$DISTRO" == "fedora" ]]; then
         echo "       Update your kernel: sudo dnf upgrade --refresh"
+    elif [[ "$IS_DEBIAN" == "true" ]]; then
+        echo "       Debian 13 ships kernel 6.12. Install a newer kernel from"
+        echo "       trixie-backports."
     else
         echo "       Ubuntu 24.04 ships kernel 6.8. Upgrade to 25.10 (ships 6.17) or"
         echo "       install a mainline kernel build."
@@ -230,10 +286,10 @@ elif [[ "$DISTRO" == "fedora" ]]; then
     fi
 
 elif [[ "$DISTRO" == "ubuntu" ]]; then
-    # On Ubuntu, libcamera was already verified in step 2 (built from source).
-    # We only install DKMS prerequisites — do NOT install libcamera from apt
-    # (it's too old and would conflict with the source build).
-    echo "  ✓ libcamera already installed (from source)"
+    # On Debian/Ubuntu, step 2 already found libcamera (from repos or a source
+    # build). We only install DKMS prerequisites — do NOT install libcamera
+    # from apt here (it could replace a source build).
+    echo "  ✓ libcamera already installed (verified in step 2)"
 
     if ! command -v dkms >/dev/null 2>&1; then
         echo "  Installing DKMS prerequisites..."
@@ -530,10 +586,8 @@ if [[ "$SENSOR" == "ov02e10" ]] && $SENSOR_IS_FLIPPED; then
     # Ordinary system updates (dnf/apt/pacman upgrade) overwrite the patched
     # .so with the stock distro build, silently bringing the purple back — so
     # "backup exists" isn't enough; the version has to still match.
-    CUR_LC_VER=""
-    if command -v pkg-config >/dev/null 2>&1; then
-        CUR_LC_VER=$(pkg-config --modversion libcamera 2>/dev/null | grep -oP '^[0-9]+\.[0-9]+\.[0-9]+' || true)
-    fi
+    # The backup records the version that was built (0.7.0 floored to 0.7.2).
+    CUR_LC_VER=$(floor_libcamera_version "$(libcamera_installed_version)")
     if [[ -z "$CUR_LC_VER" ]]; then
         CUR_LC_VER=$(ls -l /usr/local/lib64/libcamera.so.* /usr/local/lib/*/libcamera.so.* /usr/local/lib/libcamera.so.* \
             /usr/lib64/libcamera.so.* /usr/lib/*/libcamera.so.* /usr/lib/libcamera.so.* 2>/dev/null \

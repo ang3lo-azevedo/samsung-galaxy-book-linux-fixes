@@ -50,12 +50,17 @@ except (ValueError, ImportError):
 RELAY_CMD = "/usr/local/bin/camera-relay"
 
 # Runtime state files written by camera-relay in its cache dir (same paths as
-# STATE_CACHE / PID_FILE there, except under $RUNTIME_DIRECTORY, which only
-# the Nix unit sets — and Nix ships no tray). The daemon flips the state file
-# between "idle" and "streaming" on every transition and removes it (plus the
-# pid file) on stop — so watching them means the icon can react in
-# milliseconds instead of waiting for the next poll.
+# STATE_CACHE / PID_FILE there). The daemon flips the state file between
+# "idle" and "streaming" on every transition and removes it (plus the pid
+# file) on stop — so watching them means the icon can react in milliseconds
+# instead of waiting for the next poll.
 RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+# The Nix unit sets RuntimeDirectory=camera-relay, so its relay keeps the
+# state file in this subdirectory while the pid file stays in RUNTIME_DIR.
+# systemd deletes and recreates it on every service restart, which ends a
+# watch on it, so it is watched again whenever it reappears.
+STATE_SUBDIR_NAME = "camera-relay"
+STATE_SUBDIR = os.path.join(RUNTIME_DIR, STATE_SUBDIR_NAME)
 WATCH_FILES = ("camera-relay-state", "camera-relay.pid")
 
 # Safety-net poll for anything the file watch could miss (e.g. a relay that
@@ -108,23 +113,23 @@ class CameraRelaySystray:
         )
 
     def _install_runtime_watch(self):
-        """Monitor the runtime dir for changes to the relay's state files.
+        """Monitor the runtime dirs for changes to the relay's state files.
 
-        Uses one directory watcher (handles create/delete/attribution, and
+        Uses directory watchers (handle create/delete/attribution, and
         the file does not have to exist yet — e.g. when the relay is stopped
         at startup). Events are debounced: `echo … > file` triggers
         several inotify events in quick succession, and each of those would
         otherwise spawn a status subprocess.
         """
         try:
-            gio_dir = Gio.File.new_for_path(RUNTIME_DIR)
-            self._runtime_monitor = gio_dir.monitor_directory(
-                Gio.FileMonitorFlags.NONE, None
-            )
-            self._runtime_monitor.connect("changed", self._on_runtime_event)
+            self._runtime_monitor = self._watch_dir(RUNTIME_DIR)
+            self._state_subdir_monitor = None
+            if os.path.isdir(STATE_SUBDIR):
+                self._state_subdir_monitor = self._watch_dir(STATE_SUBDIR)
             return True
         except Exception as e:  # watcher unavailable -> back to the old poll
             self._runtime_monitor = None
+            self._state_subdir_monitor = None
             print(
                 "camera-relay-systray: file watch unavailable (%s), "
                 "polling every %ds instead." % (e, UNWATCHED_POLL_INTERVAL),
@@ -132,9 +137,28 @@ class CameraRelaySystray:
             )
             return False
 
-    def _on_runtime_event(self, _monitor, file, _other_file, _event_type):
+    def _watch_dir(self, path):
+        monitor = Gio.File.new_for_path(path).monitor_directory(
+            Gio.FileMonitorFlags.NONE, None
+        )
+        monitor.connect("changed", self._on_runtime_event)
+        return monitor
+
+    def _on_runtime_event(self, monitor, file, _other_file, event_type):
         name = file.get_basename() if file else ""
-        if name in WATCH_FILES:
+        if (
+            monitor is self._runtime_monitor
+            and name == STATE_SUBDIR_NAME
+            and event_type == Gio.FileMonitorEvent.CREATED
+        ):
+            try:
+                if self._state_subdir_monitor:
+                    self._state_subdir_monitor.cancel()
+                self._state_subdir_monitor = self._watch_dir(STATE_SUBDIR)
+            except Exception:
+                self._state_subdir_monitor = None
+            self._deferred_poll()
+        elif name in WATCH_FILES:
             self._deferred_poll()
 
     def _deferred_poll(self):

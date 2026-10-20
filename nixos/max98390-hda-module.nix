@@ -5,6 +5,7 @@
   fetchFromGitHub,
   llvmPackages,
   gcc,
+  xz,
   sourceType ? "github",
   localSrc ? ../speaker-fix/src,
   githubOwner ? "Andycodeman",
@@ -33,7 +34,7 @@ stdenvNoCC.mkDerivation {
 
   nativeBuildInputs =
     kernel.moduleBuildDependencies
-    ++ [ cc ]
+    ++ [ cc xz ]
     ++ lib.optionals kernelUsesClang [ llvmPackages.lld ];
 
   makeFlags = [
@@ -45,9 +46,11 @@ stdenvNoCC.mkDerivation {
     "LD=${llvmPackages.lld}/bin/ld.lld"
   ];
 
+  # Through modules_install for the .ko.cer newer nixpkgs needs (see webcam-fix-book5.nix)
   installPhase = ''
-    install -D snd-hda-scodec-max98390.ko $out/lib/modules/${kernel.modDirVersion}/extra/snd-hda-scodec-max98390.ko
-    install -D snd-hda-scodec-max98390-i2c.ko $out/lib/modules/${kernel.modDirVersion}/extra/snd-hda-scodec-max98390-i2c.ko
+    make -C ${kernel.dev}/lib/modules/${kernel.modDirVersion}/build M=$PWD \
+      ${lib.escapeShellArgs kernel.commonMakeFlags} \
+      INSTALL_MOD_PATH=$out INSTALL_MOD_DIR=extra DEPMOD=true modules_install
   '';
 
   meta = with lib; {

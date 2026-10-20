@@ -40,7 +40,7 @@ let
 
     src = ../ov02c10-26mhz-fix;
 
-    nativeBuildInputs = [ kernel.dev cc pkgs.gnumake pkgs.perl ]
+    nativeBuildInputs = [ kernel.dev cc pkgs.gnumake pkgs.perl pkgs.xz ]
       ++ lib.optionals kernelUsesClang [ pkgs.llvmPackages.lld ];
 
     buildPhase = ''
@@ -53,9 +53,11 @@ let
     # result; depmod's default search order puts updates/ ahead of the in-tree
     # kernel/ tree, so this copy is the one modules.dep resolves to. Verified
     # against a synthetic in-tree conflict, not assumed.
+    # Through modules_install for the .ko.cer newer nixpkgs needs (see webcam-fix-book5.nix)
     installPhase = ''
-      install -Dm644 ov02c10.ko \
-        $out/lib/modules/${kernel.modDirVersion}/updates/ov02c10.ko
+      make -C ${kernel.dev}/lib/modules/${kernel.modDirVersion}/build M=$PWD \
+        ${lib.escapeShellArgs kernel.commonMakeFlags} \
+        INSTALL_MOD_PATH=$out INSTALL_MOD_DIR=updates DEPMOD=true modules_install
     '';
 
     meta = with lib; {

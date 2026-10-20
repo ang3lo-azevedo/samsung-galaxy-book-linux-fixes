@@ -16,6 +16,16 @@
   # own nixpkgs (CachyOS) are built with a different clang/lld than the system
   # one, and objtool rejects objects from a mismatched toolchain.
   clangMakeFlags = lib.optionalString kernelUsesClang (lib.escapeShellArgs kernel.commonMakeFlags);
+  # Through Kbuild's modules_install rather than copying the .ko: nixpkgs from
+  # 2026-10-13 on has the kernel's make flags sign each module with kmodigest
+  # there, and aggregateModules fails on a module without its .ko.cer
+  # (NixOS/nixpkgs#575192). The flags are always passed, since that signing
+  # hook is one of them. DEPMOD=true: NixOS runs depmod over the merged tree.
+  installModules = ''
+    make -C ${kernel.dev}/lib/modules/${kernel.modDirVersion}/build M=$PWD \
+      ${lib.escapeShellArgs kernel.commonMakeFlags} \
+      INSTALL_MOD_PATH=$out INSTALL_MOD_DIR=extra DEPMOD=true modules_install
+  '';
 
   # The patches below are cut against this release and do not apply to
   # 0.7.0, 0.7.1 or later versions, which rework the simple IPA.
@@ -114,7 +124,7 @@
     src = visionDriversSrc;
 
     nativeBuildInputs =
-      [kernelPackages.kernel.dev cc pkgs.gnumake pkgs.perl]
+      [kernelPackages.kernel.dev cc pkgs.gnumake pkgs.perl pkgs.xz]
       ++ lib.optionals kernelUsesClang [pkgs.llvmPackages.lld];
 
     buildPhase = ''
@@ -122,9 +132,7 @@
         M=$PWD modules ${clangMakeFlags}
     '';
 
-    installPhase = ''
-      install -Dm644 intel_cvs.ko $out/lib/modules/${kernelPackages.kernel.modDirVersion}/extra/intel_cvs.ko
-    '';
+    installPhase = installModules;
 
     meta = with lib; {
       description = "Intel Vision Driver (intel_cvs) for Samsung Galaxy Book5 webcam support";
@@ -140,7 +148,7 @@
     src = ../webcam-fix-book5/ipu-bridge-fix;
 
     nativeBuildInputs =
-      [kernelPackages.kernel.dev cc pkgs.gnumake pkgs.perl]
+      [kernelPackages.kernel.dev cc pkgs.gnumake pkgs.perl pkgs.xz]
       ++ lib.optionals kernelUsesClang [pkgs.llvmPackages.lld];
 
     buildPhase = ''
@@ -148,9 +156,7 @@
         M=$PWD modules ${clangMakeFlags}
     '';
 
-    installPhase = ''
-      install -Dm644 ipu-bridge.ko $out/lib/modules/${kernelPackages.kernel.modDirVersion}/extra/ipu-bridge.ko
-    '';
+    installPhase = installModules;
 
     meta = with lib; {
       description = "Samsung ipu-bridge rotation fix for Galaxy Book5 cameras";
@@ -166,7 +172,7 @@
     src = ../webcam-fix-book5/ov02e10-lownoise-fix;
 
     nativeBuildInputs =
-      [kernelPackages.kernel.dev cc pkgs.gnumake pkgs.perl]
+      [kernelPackages.kernel.dev cc pkgs.gnumake pkgs.perl pkgs.xz]
       ++ lib.optionals kernelUsesClang [pkgs.llvmPackages.lld];
 
     buildPhase = ''
@@ -174,9 +180,7 @@
         M=$PWD modules ${clangMakeFlags}
     '';
 
-    installPhase = ''
-      install -Dm644 ov02e10.ko $out/lib/modules/${kernelPackages.kernel.modDirVersion}/extra/ov02e10.ko
-    '';
+    installPhase = installModules;
 
     meta = with lib; {
       description = "OV02E10 driver with analog gain cap and digital gain parameters";

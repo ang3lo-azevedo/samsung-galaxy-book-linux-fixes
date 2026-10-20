@@ -41,7 +41,7 @@ in {
           src = ../webcam-fix-book5/ipu-bridge-fix;
 
           nativeBuildInputs =
-            [kernelPackages.kernel.dev cc pkgs.gnumake pkgs.perl]
+            [kernelPackages.kernel.dev cc pkgs.gnumake pkgs.perl pkgs.xz]
             ++ lib.optionals kernelUsesClang [pkgs.llvmPackages.lld];
 
           buildPhase = ''
@@ -49,8 +49,11 @@ in {
               M=$PWD modules ${clangMakeFlags}
           '';
 
+          # Through modules_install for the .ko.cer newer nixpkgs needs (see webcam-fix-book5.nix)
           installPhase = ''
-            install -Dm644 ipu-bridge.ko $out/lib/modules/${kernelPackages.kernel.modDirVersion}/extra/ipu-bridge.ko
+            make -C ${kernel.dev}/lib/modules/${kernel.modDirVersion}/build M=$PWD \
+              ${lib.escapeShellArgs kernel.commonMakeFlags} \
+              INSTALL_MOD_PATH=$out INSTALL_MOD_DIR=extra DEPMOD=true modules_install
           '';
         })
       ];

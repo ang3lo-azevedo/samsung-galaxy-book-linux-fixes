@@ -24,7 +24,8 @@
     if kernelUsesClang
     then pkgs.llvmPackages.clang-unwrapped
     else pkgs.gcc;
-  clangMakeFlags = lib.optionalString kernelUsesClang (lib.escapeShellArgs kernel.commonMakeFlags);
+  # The kernel package set's own module make flags (see webcam-fix-book5.nix)
+  moduleMakeFlags = lib.escapeShellArgs kernelPackages.kernelModuleMakeFlags;
 in {
   options.hardware.samsungGalaxyBook.ipuBridgeFix = {
     enable = lib.mkEnableOption "out-of-tree ipu-bridge override reporting sensor rotation";
@@ -42,17 +43,18 @@ in {
 
           nativeBuildInputs =
             [kernelPackages.kernel.dev cc pkgs.gnumake pkgs.perl pkgs.xz]
+            ++ kernel.moduleBuildDependencies
             ++ lib.optionals kernelUsesClang [pkgs.llvmPackages.lld];
 
           buildPhase = ''
             make -C ${kernelPackages.kernel.dev}/lib/modules/${kernelPackages.kernel.modDirVersion}/build \
-              M=$PWD modules ${clangMakeFlags}
+              M=$PWD modules ${moduleMakeFlags}
           '';
 
           # Through modules_install for the .ko.cer newer nixpkgs needs (see webcam-fix-book5.nix)
           installPhase = ''
             make -C ${kernel.dev}/lib/modules/${kernel.modDirVersion}/build M=$PWD \
-              ${lib.escapeShellArgs kernel.commonMakeFlags} \
+              ${moduleMakeFlags} \
               INSTALL_MOD_PATH=$out INSTALL_MOD_DIR=extra DEPMOD=true modules_install
           '';
         })

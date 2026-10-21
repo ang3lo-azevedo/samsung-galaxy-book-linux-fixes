@@ -12,10 +12,12 @@
     if kernelUsesClang
     then pkgs.llvmPackages.clang-unwrapped
     else pkgs.gcc;
-  # The kernel's own make flags, not pkgs.llvmPackages: kernels that pin their
-  # own nixpkgs (CachyOS) are built with a different clang/lld than the system
-  # one, and objtool rejects objects from a mismatched toolchain.
-  clangMakeFlags = lib.optionalString kernelUsesClang (lib.escapeShellArgs kernel.commonMakeFlags);
+  # The kernel package set's own module make flags, as nixpkgs' modules use them:
+  # absolute paths to the toolchain the kernel was built with (kernels that pin
+  # their own nixpkgs, like CachyOS, use a different clang than the system, and
+  # objtool rejects mismatched objects), including the objcopy that BTF generation
+  # runs, and from nixpkgs 2026-10-13 on the kmodigest hook that signs modules.
+  moduleMakeFlags = lib.escapeShellArgs kernelPackages.kernelModuleMakeFlags;
   # Through Kbuild's modules_install rather than copying the .ko: nixpkgs from
   # 2026-10-13 on has the kernel's make flags sign each module with kmodigest
   # there, and aggregateModules fails on a module without its .ko.cer
@@ -23,7 +25,7 @@
   # hook is one of them. DEPMOD=true: NixOS runs depmod over the merged tree.
   installModules = ''
     make -C ${kernel.dev}/lib/modules/${kernel.modDirVersion}/build M=$PWD \
-      ${lib.escapeShellArgs kernel.commonMakeFlags} \
+      ${moduleMakeFlags} \
       INSTALL_MOD_PATH=$out INSTALL_MOD_DIR=extra DEPMOD=true modules_install
   '';
 
@@ -125,11 +127,13 @@
 
     nativeBuildInputs =
       [kernelPackages.kernel.dev cc pkgs.gnumake pkgs.perl pkgs.xz]
+      # pahole and the rest of what BTF generation and module compression need
+      ++ kernel.moduleBuildDependencies
       ++ lib.optionals kernelUsesClang [pkgs.llvmPackages.lld];
 
     buildPhase = ''
       make -C ${kernelPackages.kernel.dev}/lib/modules/${kernelPackages.kernel.modDirVersion}/build \
-        M=$PWD modules ${clangMakeFlags}
+        M=$PWD modules ${moduleMakeFlags}
     '';
 
     installPhase = installModules;
@@ -149,11 +153,13 @@
 
     nativeBuildInputs =
       [kernelPackages.kernel.dev cc pkgs.gnumake pkgs.perl pkgs.xz]
+      # pahole and the rest of what BTF generation and module compression need
+      ++ kernel.moduleBuildDependencies
       ++ lib.optionals kernelUsesClang [pkgs.llvmPackages.lld];
 
     buildPhase = ''
       make -C ${kernelPackages.kernel.dev}/lib/modules/${kernelPackages.kernel.modDirVersion}/build \
-        M=$PWD modules ${clangMakeFlags}
+        M=$PWD modules ${moduleMakeFlags}
     '';
 
     installPhase = installModules;
@@ -173,11 +179,13 @@
 
     nativeBuildInputs =
       [kernelPackages.kernel.dev cc pkgs.gnumake pkgs.perl pkgs.xz]
+      # pahole and the rest of what BTF generation and module compression need
+      ++ kernel.moduleBuildDependencies
       ++ lib.optionals kernelUsesClang [pkgs.llvmPackages.lld];
 
     buildPhase = ''
       make -C ${kernelPackages.kernel.dev}/lib/modules/${kernelPackages.kernel.modDirVersion}/build \
-        M=$PWD modules ${clangMakeFlags}
+        M=$PWD modules ${moduleMakeFlags}
     '';
 
     installPhase = installModules;

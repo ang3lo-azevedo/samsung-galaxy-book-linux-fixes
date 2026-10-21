@@ -28,11 +28,8 @@ let
   inherit (kernelPackages) kernel;
   kernelUsesClang = kernel.stdenv.cc.isClang or false;
   cc = if kernelUsesClang then pkgs.llvmPackages.clang-unwrapped else pkgs.gcc;
-  # The kernel's own make flags, not pkgs.llvmPackages: kernels that pin their
-  # own nixpkgs (CachyOS) are built with a different clang/lld than the system
-  # one, and objtool rejects objects from a mismatched toolchain.
-  clangMakeFlags = lib.optionalString kernelUsesClang
-    (lib.escapeShellArgs kernel.commonMakeFlags);
+  # The kernel package set's own module make flags (see webcam-fix-book5.nix)
+  moduleMakeFlags = lib.escapeShellArgs kernelPackages.kernelModuleMakeFlags;
 
   ov02c10Module = pkgs.stdenvNoCC.mkDerivation {
     pname = "ov02c10-26mhz";
@@ -41,11 +38,12 @@ let
     src = ../ov02c10-26mhz-fix;
 
     nativeBuildInputs = [ kernel.dev cc pkgs.gnumake pkgs.perl pkgs.xz ]
+      ++ kernel.moduleBuildDependencies
       ++ lib.optionals kernelUsesClang [ pkgs.llvmPackages.lld ];
 
     buildPhase = ''
       make -C ${kernel.dev}/lib/modules/${kernel.modDirVersion}/build \
-        M=$PWD modules ${clangMakeFlags}
+        M=$PWD modules ${moduleMakeFlags}
     '';
 
     # updates/ is where DKMS puts it. NixOS merges the kernel and every
@@ -56,7 +54,7 @@ let
     # Through modules_install for the .ko.cer newer nixpkgs needs (see webcam-fix-book5.nix)
     installPhase = ''
       make -C ${kernel.dev}/lib/modules/${kernel.modDirVersion}/build M=$PWD \
-        ${lib.escapeShellArgs kernel.commonMakeFlags} \
+        ${moduleMakeFlags} \
         INSTALL_MOD_PATH=$out INSTALL_MOD_DIR=updates DEPMOD=true modules_install
     '';
 

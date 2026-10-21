@@ -2,9 +2,8 @@
   stdenvNoCC,
   lib,
   kernel,
+  kernelModuleMakeFlags,
   fetchFromGitHub,
-  llvmPackages,
-  gcc,
   xz,
   sourceType ? "github",
   localSrc ? ../speaker-fix/src,
@@ -15,8 +14,6 @@
 }:
 
 let
-  kernelUsesClang = kernel.stdenv.cc.isClang or false;
-  cc = if kernelUsesClang then llvmPackages.clang-unwrapped else gcc;
   src = if sourceType == "local" then localSrc else fetchFromGitHub {
     owner = githubOwner;
     repo = githubRepo;
@@ -32,24 +29,19 @@ stdenvNoCC.mkDerivation {
   inherit src;
   sourceRoot = lib.optionalString (sourceType == "github") "source/speaker-fix/src";
 
-  nativeBuildInputs =
-    kernel.moduleBuildDependencies
-    ++ [ cc xz ]
-    ++ lib.optionals kernelUsesClang [ llvmPackages.lld ];
+  nativeBuildInputs = kernel.moduleBuildDependencies ++ [ xz ];
 
-  makeFlags = [
+  # The kernel package set's own module make flags (see webcam-fix-book5.nix): they
+  # name the toolchain the kernel was built with, gcc or clang alike
+  makeFlags = kernelModuleMakeFlags ++ [
     "KVER=${kernel.modDirVersion}"
     "KDIR=${kernel.dev}/lib/modules/${kernel.modDirVersion}/build"
-  ] ++ lib.optionals kernelUsesClang [
-    "LLVM=1"
-    "CC=${cc}/bin/clang"
-    "LD=${llvmPackages.lld}/bin/ld.lld"
   ];
 
   # Through modules_install for the .ko.cer newer nixpkgs needs (see webcam-fix-book5.nix)
   installPhase = ''
     make -C ${kernel.dev}/lib/modules/${kernel.modDirVersion}/build M=$PWD \
-      ${lib.escapeShellArgs kernel.commonMakeFlags} \
+      ${lib.escapeShellArgs kernelModuleMakeFlags} \
       INSTALL_MOD_PATH=$out INSTALL_MOD_DIR=extra DEPMOD=true modules_install
   '';
 

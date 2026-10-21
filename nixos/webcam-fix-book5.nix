@@ -119,6 +119,14 @@
     hash = "sha256-zOvCZKGwOGT9kcJiefzx/duHqR0V8PYhNbqsMHkH1r4=";
   };
 
+  # FIXME: Drop the override once nixpkgs' v4l2loopback passes DEPMOD itself. Kbuild's
+  # modules_install runs depmod whenever the kernel ships a System.map, as chaotic's does,
+  # and the index files it leaves (modules.alias, modules.dep, ...) collide with the merged
+  # module tree. The modules below avoid it the same way
+  v4l2loopback = kernelPackages.v4l2loopback.overrideAttrs (old: {
+    makeFlags = old.makeFlags ++ ["DEPMOD=true"];
+  });
+
   intelCvsModule = pkgs.stdenvNoCC.mkDerivation {
     pname = "vision-driver";
     version = "1.0.0-${kernelPackages.kernel.modDirVersion}";
@@ -566,7 +574,7 @@ in {
           [
             intelCvsModule
             ipuBridgeModule
-            kernelPackages.v4l2loopback
+            v4l2loopback
           ]
           ++ lib.optional cfg.lowNoise.enable ov02e10LowNoiseModule;
 

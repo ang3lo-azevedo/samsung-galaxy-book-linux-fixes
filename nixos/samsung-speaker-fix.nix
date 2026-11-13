@@ -138,8 +138,16 @@ in
   };
 
   config = {
-    # Build and install the out-of-tree kernel modules
-    boot.extraModulePackages = [ max98390-hda ];
+    # Build and install the out-of-tree kernel modules. preferLocalBuild plus the
+    # host-only "local" system feature keep the build on this machine: offloading
+    # it to eu.nixbuild.net would upload the whole substituted kernel just to
+    # compile one small module.
+    boot.extraModulePackages = [
+      (max98390-hda.overrideAttrs (o: {
+        preferLocalBuild = true;
+        requiredSystemFeatures = (o.requiredSystemFeatures or [ ]) ++ [ "local" ];
+      }))
+    ];
 
     # Load the modules at boot
     boot.kernelModules = [

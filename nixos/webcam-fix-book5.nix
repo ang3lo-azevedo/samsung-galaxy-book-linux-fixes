@@ -570,13 +570,26 @@ in {
           "v4l2loopback"
         ];
 
+        # Pin these out-of-tree module builds to this host. Offloaded to the
+        # eu.nixbuild.net remote builder they drag the whole substituted kernel
+        # (hundreds of MB) up the uplink just to compile a few small modules.
+        # "local" is a system feature only this host advertises (see the host's
+        # nix.settings.system-features), so the build cannot leave the machine.
         extraModulePackages =
-          [
-            intelCvsModule
-            ipuBridgeModule
-            v4l2loopback
-          ]
-          ++ lib.optional cfg.lowNoise.enable ov02e10LowNoiseModule;
+          map
+          (m:
+            m.overrideAttrs (o: {
+              preferLocalBuild = true;
+              requiredSystemFeatures = (o.requiredSystemFeatures or [ ]) ++ [ "local" ];
+            }))
+          (
+            [
+              intelCvsModule
+              ipuBridgeModule
+              v4l2loopback
+            ]
+            ++ lib.optional cfg.lowNoise.enable ov02e10LowNoiseModule
+          );
 
         extraModprobeConfig = lib.mkIf cfg.lowNoise.enable ''
           options ov02e10 max_again=${toString cfg.lowNoise.maxAnalogueGain} dgain=${toString cfg.lowNoise.digitalGain}

@@ -35,6 +35,9 @@ let
     pname = "ov02c10-26mhz";
     version = "1.0-${kernel.modDirVersion}";
 
+    preferLocalBuild = true;
+    requiredSystemFeatures = ["local"];
+
     src = ../ov02c10-26mhz-fix;
 
     nativeBuildInputs = [ kernel.dev cc pkgs.gnumake pkgs.perl pkgs.xz ]

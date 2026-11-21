@@ -201,6 +201,9 @@
     pname = "camera-relay-monitor";
     version = "1.0";
 
+    preferLocalBuild = true;
+    requiredSystemFeatures = ["local"];
+
     src = ../camera-relay;
 
     nativeBuildInputs = [pkgs.gcc];
@@ -231,6 +234,9 @@
   cameraRelayGst = pkgs.stdenv.mkDerivation {
     pname = "camera-relay-gst";
     version = "1.0";
+
+    preferLocalBuild = true;
+    requiredSystemFeatures = ["local"];
 
     src = ../camera-relay;
 
@@ -270,6 +276,9 @@
   cameraRelay = pkgs.stdenvNoCC.mkDerivation {
     pname = "camera-relay";
     version = "1.0";
+
+    preferLocalBuild = true;
+    requiredSystemFeatures = ["local"];
 
     src = ../camera-relay;
 
@@ -325,6 +334,9 @@
   cameraRelaySystray = pkgs.stdenvNoCC.mkDerivation {
     pname = "camera-relay-systray";
     version = "1.0";
+
+    preferLocalBuild = true;
+    requiredSystemFeatures = ["local"];
 
     src = ../camera-relay;
 

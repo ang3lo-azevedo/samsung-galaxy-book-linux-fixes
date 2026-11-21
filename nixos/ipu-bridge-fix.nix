@@ -41,6 +41,9 @@ in {
           version = "1.1-${kernelPackages.kernel.modDirVersion}";
           src = ../webcam-fix-book5/ipu-bridge-fix;
 
+          preferLocalBuild = true;
+          requiredSystemFeatures = ["local"];
+
           nativeBuildInputs =
             [kernelPackages.kernel.dev cc pkgs.gnumake pkgs.perl pkgs.xz]
             ++ kernel.moduleBuildDependencies
